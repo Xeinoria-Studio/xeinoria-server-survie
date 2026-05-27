@@ -1,0 +1,795 @@
+#!===============================================================================
+#! Shulker-TVortex25
+#!===============================================================================
+#! Cible : TVortex25 (uniquement, sur le serveur survie).
+#! - Resistance seulement quand il sneake
+#! - Clic droit sur lui : ouvre son inventaire comme un coffre vivant
+#! - Clic droit avec une epee enchantee : invoque des shulker bullets temporaires
+#!   qui ciblent les joueurs proches, avec priorite au dernier attaquant
+#!===============================================================================
+
+import:
+    org.bukkit.entity.EntityType
+    org.bukkit.event.inventory.ClickType
+    org.bukkit.event.player.PlayerInteractEntityEvent
+    org.bukkit.inventory.EquipmentSlot
+
+options:
+    target-name: TVortex25
+    debug-enabled: false
+    upkeep-period: 5 ticks
+    resistance-duration: 12 ticks
+    spell-cooldown: 8 seconds
+    bullet-lifetime: 16 seconds
+    bullet-target-radius: 18
+    bullet-fallback-radius: 48
+    bullet-max-vertical-diff: 8
+    attacker-memory: 12 seconds
+    interact-sound-volume: 0.8
+    interact-close-distance: 4
+    interact-close-distance-creative: 6
+    interact-hear-radius: 12
+    interact-deny-sound-cooldown: 10 ticks
+    interact-deny-sound: block.chest.locked
+    interact-deny-sound-volume: 0.8
+    interact-deny-sound-pitch: 1
+
+function tvortexShulkerDebug(msg: text):
+    if {tvortexShulker.debug} is true:
+        send "&8[TVortex25-Debug] &7%{_msg}%" to console
+
+function tvortexShulkerIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function tvortexShulkerIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function tvortexShulkerIsVanished(p: player) :: boolean:
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function tvortexShulkerIsSword(it: itemstack) :: boolean:
+    if {_it} is wooden sword:
+        return true
+    if {_it} is stone sword:
+        return true
+    if {_it} is iron sword:
+        return true
+    if {_it} is golden sword:
+        return true
+    if {_it} is diamond sword:
+        return true
+    if {_it} is netherite sword:
+        return true
+    return false
+
+function tvortexShulkerCanCastWith(it: itemstack) :: boolean:
+    if tvortexShulkerIsSword({_it}) is true:
+        return true
+    return false
+
+function tvortexShulkerApplyShellResistance(p: player):
+    apply potion effect of resistance to {_p} for {@resistance-duration}:
+        hide the particles
+        hide the icon
+
+function tvortexShulkerRemoveShellResistance(p: player):
+    remove resistance from {_p}
+
+function tvortexShulkerDisableAll(p: player):
+    tvortexShulkerRemoveShellResistance({_p})
+    tvortexShulkerClearAttacker({_p})
+
+function tvortexShulkerUpdateShell(p: player):
+    if tvortexShulkerIsInactive({_p}) is true:
+        tvortexShulkerDisableAll({_p})
+        stop
+    if {_p} is sneaking:
+        tvortexShulkerApplyShellResistance({_p})
+    else:
+        tvortexShulkerRemoveShellResistance({_p})
+
+function tvortexShulkerSpellReady(p: player) :: boolean:
+    set {_id} to "%uuid of {_p}%"
+    if {tvortexShulker.spellCd::%{_id}%} is not set:
+        return true
+    if now >= {tvortexShulker.spellCd::%{_id}%}:
+        return true
+    return false
+
+function tvortexShulkerMarkSpellCooldown(p: player):
+    set {tvortexShulker.spellCd::%uuid of {_p}%} to now + {@spell-cooldown}
+
+function tvortexShulkerClearAttacker(p: player):
+    delete {tvortexShulker.lastAttacker::%uuid of {_p}%}
+    delete {tvortexShulker.lastAttackerUntil::%uuid of {_p}%}
+    delete {tvortexShulker.priorityTargetCurrent::%uuid of {_p}%}
+    delete {tvortexShulker.priorityTargets::%uuid of {_p}%::*}
+    delete {tvortexShulker.priorityTargetUntil::%uuid of {_p}%::*}
+    delete {tvortexShulker.priorityTargetEntity::%uuid of {_p}%::*}
+
+function tvortexShulkerRememberPriorityTarget(caster: player, attacker: entity):
+    if tvortexShulkerCanTargetEntity({_attacker}, {_caster}) is false:
+        stop
+    set {_cid} to "%uuid of {_caster}%"
+    set {_aid} to "%uuid of {_attacker}%"
+    remove {_aid} from {tvortexShulker.priorityTargets::%{_cid}%::*}
+    add {_aid} to {tvortexShulker.priorityTargets::%{_cid}%::*}
+    set {tvortexShulker.priorityTargetCurrent::%{_cid}%} to {_attacker}
+    set {tvortexShulker.priorityTargetEntity::%{_cid}%::%{_aid}%} to {_attacker}
+    set {tvortexShulker.priorityTargetUntil::%{_cid}%::%{_aid}%} to now + {@attacker-memory}
+
+function tvortexShulkerGetPriorityTarget(caster: player) :: entity:
+    set {_cid} to "%uuid of {_caster}%"
+    set {_best} to {none}
+    set {_bestUntil} to 0
+    set {_current} to {tvortexShulker.priorityTargetCurrent::%{_cid}%}
+    if {_current} is set:
+        if tvortexShulkerCanTargetEntity({_current}, {_caster}) is true:
+            if world of {_current} is world of {_caster}:
+                if distance between {_current} and {_caster} <= {@bullet-fallback-radius}:
+                    set {_aid} to "%uuid of {_current}%"
+                    set {_until} to {tvortexShulker.priorityTargetUntil::%{_cid}%::%{_aid}%}
+                    if {_until} is set:
+                        set {_best} to {_current}
+                        set {_bestUntil} to {_until}
+    loop {tvortexShulker.priorityTargets::%{_cid}%::*}:
+        set {_candidate} to {tvortexShulker.priorityTargetEntity::%{_cid}%::%loop-value%}
+        if {_candidate} is set:
+            if tvortexShulkerCanTargetEntity({_candidate}, {_caster}) is true:
+                if world of {_candidate} is world of {_caster}:
+                    if distance between {_candidate} and {_caster} <= {@bullet-fallback-radius}:
+                        set {_until} to {tvortexShulker.priorityTargetUntil::%{_cid}%::%loop-value%}
+                        if {_until} is set:
+                            if {_until} > {_bestUntil}:
+                                set {_bestUntil} to {_until}
+                                set {_best} to {_candidate}
+            else:
+                remove loop-value from {tvortexShulker.priorityTargets::%{_cid}%::*}
+                delete {tvortexShulker.priorityTargetUntil::%{_cid}%::%loop-value%}
+                delete {tvortexShulker.priorityTargetEntity::%{_cid}%::%loop-value%}
+    if {_best} is set:
+        return {_best}
+    return {none}
+
+function tvortexShulkerCanTargetPlayer(target: player, caster: player) :: boolean:
+    if {_target} is {_caster}:
+        return false
+    if {_target} is offline:
+        return false
+    if {_target} is dead:
+        return false
+    if gamemode of {_target} is creative:
+        return false
+    if gamemode of {_target} is spectator:
+        return false
+    if {hidden::%uuid of {_target}%} is true:
+        return false
+    set {_v} to placeholder "premiumvanish_isvanished" from {_target}
+    if {_v} is "Yes":
+        return false
+    return true
+
+function tvortexShulkerCanTargetMonster(target: entity, caster: player) :: boolean:
+    if tvortexShulkerIsHostileEntity({_target}) is false:
+        return false
+    if {_target} is dead:
+        return false
+    if world of {_target} is not world of {_caster}:
+        return false
+    return true
+
+function tvortexShulkerIsHostileEntity(target: entity) :: boolean:
+    if {_target} is not set:
+        return false
+    if {_target} is monster:
+        return true
+    # Fallback robuste: certains serveurs/addons peuvent ne pas tagger correctement `monster`.
+    set {_t} to lowercase "%type of {_target}%"
+    if {_t} contains "zombie":
+        return true
+    if {_t} contains "skeleton":
+        return true
+    if {_t} contains "creeper":
+        return true
+    if {_t} contains "spider":
+        return true
+    if {_t} contains "enderman":
+        return true
+    if {_t} contains "witch":
+        return true
+    if {_t} contains "phantom":
+        return true
+    if {_t} contains "drowned":
+        return true
+    if {_t} contains "husk":
+        return true
+    if {_t} contains "stray":
+        return true
+    if {_t} contains "slime":
+        return true
+    if {_t} contains "magma_cube":
+        return true
+    if {_t} contains "blaze":
+        return true
+    if {_t} contains "ghast":
+        return true
+    if {_t} contains "pillager":
+        return true
+    if {_t} contains "vindicator":
+        return true
+    if {_t} contains "evoker":
+        return true
+    if {_t} contains "ravager":
+        return true
+    if {_t} contains "guardian":
+        return true
+    if {_t} contains "warden":
+        return true
+    if {_t} contains "piglin":
+        return true
+    if {_t} contains "hoglin":
+        return true
+    if {_t} contains "zoglin":
+        return true
+    return false
+
+function tvortexShulkerCanTargetEntity(target: entity, caster: player) :: boolean:
+    if {_target} is not set:
+        return false
+    if {_target} is {_caster}:
+        return false
+    set {_dy} to y-coord of location of {_target} - y-coord of location of {_caster}
+    if {_dy} > {@bullet-max-vertical-diff}:
+        return false
+    if {_dy} < -{@bullet-max-vertical-diff}:
+        return false
+    if {_target} is player:
+        return tvortexShulkerCanTargetPlayer({_target}, {_caster})
+    if {_target} is monster:
+        return tvortexShulkerCanTargetMonster({_target}, {_caster})
+    return false
+
+function tvortexShulkerResolveAttacker(e: entity) :: entity:
+    if {_e} is not set:
+        return {none}
+    if {_e} is player:
+        return {_e}
+    if {_e} is monster:
+        return {_e}
+    if {_e} is projectile:
+        set {_s} to {_e}.getShooter()
+        if {_s} is entity:
+            return {_s}
+    return {none}
+
+function tvortexShulkerRememberAttacker(caster: player, attacker: entity):
+    if tvortexShulkerCanTargetEntity({_attacker}, {_caster}) is false:
+        stop
+    set {tvortexShulker.lastAttacker::%uuid of {_caster}%} to {_attacker}
+    set {tvortexShulker.lastAttackerUntil::%uuid of {_caster}%} to now + {@attacker-memory}
+    tvortexShulkerRememberPriorityTarget({_caster}, {_attacker})
+
+function tvortexShulkerGetRememberedAttacker(caster: player) :: entity:
+    set {_id} to "%uuid of {_caster}%"
+    if {tvortexShulker.lastAttacker::%{_id}%} is not set:
+        return {none}
+    if now > {tvortexShulker.lastAttackerUntil::%{_id}%}:
+        tvortexShulkerClearAttacker({_caster})
+        return {none}
+    set {_a} to {tvortexShulker.lastAttacker::%{_id}%}
+    if {_a} is not set:
+        tvortexShulkerClearAttacker({_caster})
+        return {none}
+    if tvortexShulkerCanTargetEntity({_a}, {_caster}) is false:
+        tvortexShulkerClearAttacker({_caster})
+        return {none}
+    if world of {_a} is not world of {_caster}:
+        tvortexShulkerClearAttacker({_caster})
+        return {none}
+    if distance between {_a} and {_caster} > {@bullet-target-radius}:
+        tvortexShulkerClearAttacker({_caster})
+        return {none}
+    return {_a}
+
+function tvortexShulkerPickNearestMonster(caster: player) :: entity:
+    set {_bestMonster} to {none}
+    set {_bestMonsterDist} to 9999
+    set {_monsterCount} to 0
+    set {_seenCount} to 0
+    # Ciblage strict monstres pour eviter les cibles passives (pig/chicken/etc).
+    loop all entities in radius {@bullet-target-radius} around {_caster}:
+        if loop-entity is not {_caster}:
+            if loop-entity is not player:
+                if loop-entity is not armor stand:
+                    add 1 to {_seenCount}
+                    if tvortexShulkerCanTargetMonster(loop-entity, {_caster}) is true:
+                        set {_d} to distance between loop-entity and {_caster}
+                        add 1 to {_monsterCount}
+                        if {_d} < {_bestMonsterDist}:
+                            set {_bestMonsterDist} to {_d}
+                            set {_bestMonster} to loop-entity
+    if {_bestMonster} is set:
+        tvortexShulkerDebug("pickNearestMonster seen=%{_seenCount}% hostiles=%{_monsterCount}% chosen=%type of {_bestMonster}% dist=%{_bestMonsterDist}%")
+        return {_bestMonster}
+    tvortexShulkerDebug("pickNearestMonster seen=%{_seenCount}% hostiles=0 radius={@bullet-target-radius}")
+    set {_logged} to 0
+    loop all entities in radius 8 around {_caster}:
+        if loop-entity is not {_caster}:
+            if loop-entity is not player:
+                if loop-entity is not armor stand:
+                    if {_logged} < 8:
+                        set {_d} to rounded (distance between loop-entity and {_caster})
+                        tvortexShulkerDebug("nearby[%{_logged}%]=%type of loop-entity% d=%{_d}% hostile=%tvortexShulkerIsHostileEntity(loop-entity)%")
+                        add 1 to {_logged}
+    return {none}
+
+function tvortexShulkerPickNearestTarget(caster: player, excludedA: entity, excludedB: entity) :: player:
+    set {_best} to {none}
+    set {_bestDist} to 9999
+    loop all players in radius {@bullet-fallback-radius} around {_caster}:
+        if tvortexShulkerCanTargetPlayer(loop-player, {_caster}) is true:
+            set {_skip} to false
+            if {_excludedA} is set:
+                if loop-player is {_excludedA}:
+                    set {_skip} to true
+            if {_excludedB} is set:
+                if loop-player is {_excludedB}:
+                    set {_skip} to true
+            if {_skip} is false:
+                set {_d} to distance between loop-player and {_caster}
+                if {_d} < {_bestDist}:
+                    set {_bestDist} to {_d}
+                    set {_best} to loop-player
+    return {_best}
+
+function tvortexShulkerPickPriorityTarget(caster: player) :: entity:
+    set {_looked} to targeted entity of {_caster}
+    if {_looked} is set:
+        if tvortexShulkerCanTargetEntity({_looked}, {_caster}) is true:
+            tvortexShulkerDebug("pickTarget=looked type=%type of {_looked}% dist=%distance between {_looked} and {_caster}%")
+            return {_looked}
+    set {_attacker} to tvortexShulkerGetPriorityTarget({_caster})
+    if {_attacker} is set:
+        if {_attacker} is player:
+            tvortexShulkerDebug("pickTarget=prio-player name=%name of {_attacker}% dist=%distance between {_attacker} and {_caster}%")
+        else:
+            tvortexShulkerDebug("pickTarget=prio-entity type=%type of {_attacker}% dist=%distance between {_attacker} and {_caster}%")
+        return {_attacker}
+    set {_remembered} to tvortexShulkerGetRememberedAttacker({_caster})
+    if {_remembered} is set:
+        if {_remembered} is player:
+            tvortexShulkerDebug("pickTarget=remembered-player name=%name of {_remembered}% dist=%distance between {_remembered} and {_caster}%")
+        else:
+            tvortexShulkerDebug("pickTarget=remembered-entity type=%type of {_remembered}% dist=%distance between {_remembered} and {_caster}%")
+        return {_remembered}
+    set {_monster} to tvortexShulkerPickNearestMonster({_caster})
+    if {_monster} is set:
+        tvortexShulkerDebug("pickTarget=monster type=%type of {_monster}% dist=%distance between {_monster} and {_caster}%")
+        return {_monster}
+    set {_fallback} to tvortexShulkerPickNearestTarget({_caster}, {none}, {none})
+    if {_fallback} is set:
+        tvortexShulkerDebug("pickTarget=fallback-player name=%name of {_fallback}% dist=%distance between {_fallback} and {_caster}%")
+        return {_fallback}
+    tvortexShulkerDebug("pickTarget=none")
+    return {none}
+
+function tvortexShulkerDeleteBulletById(id: text):
+    set {_bullet} to {tvortexShulker.bulletEntity::%{_id}%}
+    if {_bullet} is set:
+        if {_bullet}.isValid() is true:
+            {_bullet}.remove()
+    delete {tvortexShulker.bulletEntity::%{_id}%}
+    delete {tvortexShulker.bulletExpire::%{_id}%}
+    delete {tvortexShulker.bulletOwner::%{_id}%}
+    delete {tvortexShulker.bulletTarget::%{_id}%}
+
+function tvortexShulkerCleanupBulletsFor(p: player):
+    set {_owner} to "%uuid of {_p}%"
+    loop {tvortexShulker.bulletOwner::*}:
+        if loop-value is {_owner}:
+            tvortexShulkerDeleteBulletById(loop-index)
+
+function tvortexShulkerCleanupExpiredBullets():
+    loop {tvortexShulker.bulletExpire::*}:
+        set {_id} to loop-index
+        set {_bullet} to {tvortexShulker.bulletEntity::%{_id}%}
+        if {_bullet} is not set:
+            tvortexShulkerDeleteBulletById({_id})
+        else if {_bullet}.isValid() is false:
+            tvortexShulkerDeleteBulletById({_id})
+        else if now >= loop-value:
+            tvortexShulkerDeleteBulletById({_id})
+        else:
+            set {_target} to {tvortexShulker.bulletTarget::%{_id}%}
+            if {_target} is set:
+                if {_target} is dead:
+                    tvortexShulkerDebug("cleanup id=%{_id}% target-invalid")
+                else if world of {_target} is not world of {_bullet}:
+                    tvortexShulkerDebug("cleanup id=%{_id}% target-wrong-world")
+                else:
+                    set target of {_bullet} to {_target}
+
+function tvortexShulkerSpawnBullet(caster: player, target: entity):
+    # Spawn legerement devant les yeux pour eviter une collision immediate avec la hitbox du caster.
+    set {_spawn} to eye location of {_caster}
+    set {_dir} to direction of {_caster}
+    add {_dir} to {_spawn}
+    summon shulker bullet at {_spawn}
+    set {_bullet} to last spawned entity
+    {_bullet}.setShooter({_caster})
+    {_bullet}.setPersistent(false)
+    set {_id} to "%uuid of {_bullet}%"
+    set {tvortexShulker.bulletEntity::%{_id}%} to {_bullet}
+    set {tvortexShulker.bulletExpire::%{_id}%} to now + {@bullet-lifetime}
+    set {tvortexShulker.bulletOwner::%{_id}%} to "%uuid of {_caster}%"
+    if {_target} is set:
+        set {tvortexShulker.bulletTarget::%{_id}%} to {_target}
+
+    tvortexShulkerDebug("spawnBullet id=%{_id}% at=%x-coord of {_spawn}%,%y-coord of {_spawn}%,%z-coord of {_spawn}%")
+    tvortexShulkerDebug("spawnBullet id=%{_id}% casterYaw=%yaw of {_caster}% casterPitch=%pitch of {_caster}%")
+
+    if {_target} is not set:
+        # Pas de cible valide: la bullet part droit devant le regard du caster.
+        set {_lookLoc} to location of {_caster}
+        set {_launch} to {_lookLoc}.getDirection()
+        if {_launch} is set:
+            {_bullet}.setVelocity({_launch})
+            tvortexShulkerDebug("spawnBullet id=%{_id}% target=none-forward vel=%{_launch}%")
+        else:
+            tvortexShulkerDebug("spawnBullet id=%{_id}% target=none-forward direction=null")
+        stop
+    if {_target} is player:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% target=player name=%name of {_target}% loc=%x-coord of location of {_target}%,%y-coord of location of {_target}%,%z-coord of location of {_target}%")
+    else:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% target=entity type=%type of {_target}% loc=%x-coord of location of {_target}%,%y-coord of location of {_target}%,%z-coord of location of {_target}%")
+
+    # Sur certains builds 1.21+, la balle plonge si elle reste 1 tick sans target.
+    # On assigne tout de suite puis on reconfirme au tick suivant.
+    set target of {_bullet} to {_target}
+    {_bullet}.setTarget({_target})
+    tvortexShulkerDebug("spawnBullet id=%{_id}% target-set-immediate")
+
+    # On laisse la bullet finir son tick d'init avant d'assigner la cible :
+    # sinon l'IA de la shulker bullet n'a pas encore de pathfinder pret et
+    # la boule plonge vers le sol au lieu de homer.
+    wait 1 tick
+    if {_bullet}.isValid() is false:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% invalid-after-wait")
+        stop
+    if {_target} is not set:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% target-unset-after-wait")
+        stop
+    if {_target} is dead:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% target-dead")
+        stop
+    if world of {_target} is not world of {_caster}:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% target-wrong-world")
+        stop
+    # Syntaxe Skript native (SkBee) : fiable pour les shulker bullets,
+    # contrairement a la reflection .setTarget() qui peut etre ignoree.
+    set target of {_bullet} to {_target}
+    {_bullet}.setTarget({_target})
+    tvortexShulkerDebug("spawnBullet id=%{_id}% target-set-after-1t type=%type of {_target}%")
+    wait 5 ticks
+    if {_bullet}.isValid() is true:
+        tvortexShulkerDebug("spawnBullet id=%{_id}% alive+6t loc=%x-coord of location of {_bullet}%,%y-coord of location of {_bullet}%,%z-coord of location of {_bullet}% vel=%velocity of {_bullet}%")
+
+function tvortexShulkerCastSpell(caster: player) :: boolean:
+    if {_caster} is sneaking:
+        tvortexShulkerDebug("cast mode=forward-sneak")
+        tvortexShulkerSpawnBullet({_caster}, {none})
+        play sound "entity.shulker.shoot" with volume 1 and pitch 1 at {_caster}
+        loop all players in radius {@bullet-target-radius} around {_caster}:
+            show 10 "portal" particles at location of {_caster} for loop-player
+        return true
+
+    set {_t1} to tvortexShulkerPickPriorityTarget({_caster})
+    if {_t1} is set:
+        if {_t1} is player:
+            tvortexShulkerDebug("cast target=player name=%name of {_t1}%")
+        else:
+            tvortexShulkerDebug("cast target=entity type=%type of {_t1}%")
+    else:
+        tvortexShulkerDebug("cast target=none")
+    tvortexShulkerSpawnBullet({_caster}, {_t1})
+
+    play sound "entity.shulker.shoot" with volume 1 and pitch 1 at {_caster}
+    loop all players in radius {@bullet-target-radius} around {_caster}:
+        show 10 "portal" particles at location of {_caster} for loop-player
+    return true
+
+function tvortexShulkerOpenInventory(viewer: player, target: player) :: boolean:
+    set {_targetId} to "%uuid of {_target}%"
+    set {_currentViewer} to {tvortexShulker.openViewerByTarget::%{_targetId}%}
+    if {_currentViewer} is set:
+        if {_currentViewer} is player:
+            if {_currentViewer} is online:
+                if {_currentViewer} is not {_viewer}:
+                    tvortexShulkerPlayDeniedOpenSound({_viewer}, {_target})
+                    return false
+
+    set {_menu} to chest inventory with 3 rows named "&8Sac de %name of {_target}%"
+    loop 27 times:
+        set slot (loop-number - 1) of {_menu} to slot (loop-number + 8) of {_target}'s inventory
+    {_viewer}.openInventory({_menu})
+    set {tvortexShulker.openTarget::%uuid of {_viewer}%} to {_target}
+    set {tvortexShulker.openMenu::%uuid of {_viewer}%} to {_menu}
+    set {tvortexShulker.openViewerByTarget::%{_targetId}%} to {_viewer}
+
+    loop all players in radius {@interact-hear-radius} around {_target}:
+        play sound "entity.shulker.open" with volume {@interact-sound-volume} and pitch 1 at {_target} for loop-player
+        play sound "block.shulker_box.open" with volume {@interact-sound-volume} and pitch 1 at {_target} for loop-player
+    return true
+
+function tvortexShulkerPlayDeniedOpenSound(viewer: player, target: player):
+    set {_soundCd} to {tvortexShulker.interactDenySoundCd::%uuid of {_viewer}%}
+    if {_soundCd} is set:
+        if now < {_soundCd}:
+            stop
+    set {tvortexShulker.interactDenySoundCd::%uuid of {_viewer}%} to now + {@interact-deny-sound-cooldown}
+    loop all players in radius {@interact-hear-radius} around {_target}:
+        play sound "{@interact-deny-sound}" with volume {@interact-deny-sound-volume} and pitch {@interact-deny-sound-pitch} at {_target} for loop-player
+
+function tvortexShulkerCloseViewedInventoriesForTarget(target: player):
+    loop all players:
+        set {_viewedTarget} to {tvortexShulker.openTarget::%uuid of loop-player%}
+        if {_viewedTarget} is {_target}:
+            close inventory of loop-player
+
+function tvortexShulkerEnforceInventoryDistance():
+    loop all players:
+        set {_viewedTarget} to {tvortexShulker.openTarget::%uuid of loop-player%}
+        if {_viewedTarget} is set:
+            set {_maxDistance} to {@interact-close-distance}
+            if gamemode of loop-player is creative:
+                set {_maxDistance} to {@interact-close-distance-creative}
+            if {_viewedTarget} is not online:
+                close inventory of loop-player
+            else if world of loop-player is not world of {_viewedTarget}:
+                close inventory of loop-player
+            else if distance between loop-player and {_viewedTarget} > {_maxDistance}:
+                close inventory of loop-player
+
+function tvortexShulkerSyncMenuToTarget(viewer: player):
+    set {_target} to {tvortexShulker.openTarget::%uuid of {_viewer}%}
+    set {_menu} to {tvortexShulker.openMenu::%uuid of {_viewer}%}
+    if {_target} is not set:
+        stop
+    if {_menu} is not set:
+        stop
+    if {_target} is not online:
+        stop
+    if {_target} is dead:
+        stop
+    loop 27 times:
+        set slot (loop-number + 8) of {_target}'s inventory to slot (loop-number - 1) of {_menu}
+
+function tvortexShulkerSyncTargetToMenu(viewer: player):
+    set {_target} to {tvortexShulker.openTarget::%uuid of {_viewer}%}
+    set {_menu} to {tvortexShulker.openMenu::%uuid of {_viewer}%}
+    if {_target} is not set:
+        stop
+    if {_menu} is not set:
+        stop
+    if {_target} is not online:
+        stop
+    if {_target} is dead:
+        stop
+    loop 27 times:
+        set slot (loop-number - 1) of {_menu} to slot (loop-number + 8) of {_target}'s inventory
+
+function tvortexShulkerSyncOpenInventoriesRealtime():
+    loop all players:
+        if {tvortexShulker.openTarget::%uuid of loop-player%} is set:
+            if {tvortexShulker.openMenu::%uuid of loop-player%} is set:
+                if {tvortexShulker.menuDirty::%uuid of loop-player%} is true:
+                    tvortexShulkerSyncMenuToTarget(loop-player)
+                    delete {tvortexShulker.menuDirty::%uuid of loop-player%}
+                # Pull continu: reflète les changements externes en temps reel.
+                tvortexShulkerSyncTargetToMenu(loop-player)
+
+on load:
+    set {tvortexShulker.debug} to {@debug-enabled}
+    tvortexShulkerDebug("debug=%{tvortexShulker.debug}%")
+
+on join:
+    if tvortexShulkerIsTarget(player) is false:
+        stop
+    tvortexShulkerUpdateShell(player)
+
+on respawn:
+    if tvortexShulkerIsTarget(player) is false:
+        stop
+    wait 1 tick
+    tvortexShulkerUpdateShell(player)
+
+every {@upkeep-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is online:
+        tvortexShulkerUpdateShell({_p})
+    tvortexShulkerEnforceInventoryDistance()
+    tvortexShulkerCleanupExpiredBullets()
+
+every 1 tick:
+    tvortexShulkerSyncOpenInventoriesRealtime()
+
+on inventory close:
+    set {_target} to {tvortexShulker.openTarget::%uuid of player%}
+    set {_menu} to {tvortexShulker.openMenu::%uuid of player%}
+    if {_target} is not set:
+        stop
+    tvortexShulkerSyncMenuToTarget(player)
+    delete {tvortexShulker.openTarget::%uuid of player%}
+    delete {tvortexShulker.openMenu::%uuid of player%}
+    delete {tvortexShulker.menuDirty::%uuid of player%}
+    if {_target} is online:
+        loop all players in radius {@interact-hear-radius} around {_target}:
+            play sound "entity.shulker.close" with volume {@interact-sound-volume} and pitch 1 at {_target} for loop-player
+            play sound "block.shulker_box.close" with volume {@interact-sound-volume} and pitch 1 at {_target} for loop-player
+    else:
+        play sound "entity.shulker.close" with volume {@interact-sound-volume} and pitch 1 at player
+        play sound "block.shulker_box.close" with volume {@interact-sound-volume} and pitch 1 at player
+
+on inventory click:
+    set {_target} to {tvortexShulker.openTarget::%uuid of player%}
+    if {_target} is not set:
+        stop
+    set {_menu} to {tvortexShulker.openMenu::%uuid of player%}
+    if {_menu} is not set:
+        stop
+    set {_click} to "%event.getClick()%"
+    if {_click} is "SHIFT_LEFT":
+        cancel event
+        stop
+    if {_click} is "SHIFT_RIGHT":
+        cancel event
+        stop
+    if {_click} is "NUMBER_KEY":
+        cancel event
+        stop
+    if {_click} is "DROP":
+        cancel event
+        stop
+    if {_click} is "CONTROL_DROP":
+        cancel event
+        stop
+    if {_click} is "DOUBLE_CLICK":
+        cancel event
+        stop
+    if {_click} is "SWAP_OFFHAND":
+        cancel event
+        stop
+    set {tvortexShulker.menuDirty::%uuid of player%} to true
+
+on inventory drag:
+    if {tvortexShulker.openTarget::%uuid of player%} is not set:
+        stop
+    if {tvortexShulker.openMenu::%uuid of player%} is not set:
+        stop
+    set {tvortexShulker.menuDirty::%uuid of player%} to true
+
+on toggle sneak:
+    if tvortexShulkerIsTarget(player) is false:
+        stop
+    if tvortexShulkerIsInactive(player) is true:
+        tvortexShulkerDisableAll(player)
+        stop
+    if event.isSneaking() is true:
+        tvortexShulkerCloseViewedInventoriesForTarget(player)
+        tvortexShulkerApplyShellResistance(player)
+        play sound "entity.shulker.close" with volume 0.9 and pitch 1.2 at player
+    else:
+        tvortexShulkerRemoveShellResistance(player)
+        play sound "entity.shulker.open" with volume 0.9 and pitch 1.05 at player
+
+on PlayerInteractEntityEvent:
+    if event.getHand() is not EquipmentSlot.HAND:
+        stop
+    set {_viewer} to event.getPlayer()
+    # Le joueur qui clique est vanish: aucune interaction speciale,
+    # pas de son, pas d'ouverture de menu.
+    if tvortexShulkerIsVanished({_viewer}) is true:
+        stop
+    set {_clicked} to event.getRightClicked()
+    if {_clicked} is not a player:
+        stop
+    if tvortexShulkerIsTarget({_clicked}) is false:
+        stop
+    if tvortexShulkerIsInactive({_clicked}) is true:
+        stop
+    if {_viewer} is {_clicked}:
+        stop
+    if {_clicked} is sneaking:
+        event.setCancelled(true)
+        set {_soundCd} to {tvortexShulker.interactDenySoundCd::%uuid of {_viewer}%}
+        if {_soundCd} is not set:
+            set {_canPlay} to true
+        else if now >= {_soundCd}:
+            set {_canPlay} to true
+        else:
+            set {_canPlay} to false
+        if {_canPlay} is true:
+            tvortexShulkerPlayDeniedOpenSound({_viewer}, {_clicked})
+        stop
+    event.setCancelled(true)
+    tvortexShulkerOpenInventory({_viewer}, {_clicked})
+
+on right click:
+    if tvortexShulkerIsTarget(player) is false:
+        stop
+    if tvortexShulkerIsInactive(player) is true:
+        stop
+    if tvortexShulkerCanCastWith(tool of player) is false:
+        stop
+    if tvortexShulkerSpellReady(player) is false:
+        stop
+    if tvortexShulkerCastSpell(player) is false:
+        stop
+    tvortexShulkerMarkSpellCooldown(player)
+
+on damage of player:
+    if tvortexShulkerIsTarget(victim) is false:
+        stop
+    if tvortexShulkerIsInactive(victim) is true:
+        stop
+    play sound "entity.shulker.hurt" with volume 1 and pitch 1 at location of victim for all players in radius 32 around location of victim
+    if attacker is set:
+        set {_attackerId} to "%uuid of attacker%"
+        set {_bulletOwner} to {tvortexShulker.bulletOwner::%{_attackerId}%}
+        if {_bulletOwner} is set:
+            cancel event
+            if {_bulletOwner} is "%uuid of victim%":
+                remove levitation from victim
+                tvortexShulkerDeleteBulletById({_attackerId})
+            stop
+        set {_src} to tvortexShulkerResolveAttacker(attacker)
+        if {_src} is set:
+            tvortexShulkerRememberAttacker(victim, {_src})
+
+on projectile hit:
+    set {_id} to "%uuid of projectile%"
+    if {tvortexShulker.bulletExpire::%{_id}%} is set:
+        tvortexShulkerDeleteBulletById({_id})
+
+on death of player:
+    delete {tvortexShulker.interactDenySoundCd::%uuid of victim%}
+    delete {tvortexShulker.openTarget::%uuid of victim%}
+    delete {tvortexShulker.openMenu::%uuid of victim%}
+    delete {tvortexShulker.menuDirty::%uuid of victim%}
+    tvortexShulkerCloseViewedInventoriesForTarget(victim)
+    if tvortexShulkerIsTarget(victim) is false:
+        stop
+    play sound "entity.shulker.death" with volume 1.2 and pitch 1 at location of victim for all players in radius 48 around location of victim
+    tvortexShulkerRemoveShellResistance(victim)
+    delete {tvortexShulker.spellCd::%uuid of victim%}
+    tvortexShulkerClearAttacker(victim)
+    tvortexShulkerCleanupBulletsFor(victim)
+
+on quit:
+    delete {tvortexShulker.interactDenySoundCd::%uuid of player%}
+    delete {tvortexShulker.openTarget::%uuid of player%}
+    delete {tvortexShulker.openMenu::%uuid of player%}
+    delete {tvortexShulker.menuDirty::%uuid of player%}
+    tvortexShulkerCloseViewedInventoriesForTarget(player)
+    if tvortexShulkerIsTarget(player) is false:
+        stop
+    tvortexShulkerRemoveShellResistance(player)
+    delete {tvortexShulker.spellCd::%uuid of player%}
+    tvortexShulkerClearAttacker(player)
+    tvortexShulkerCleanupBulletsFor(player)

@@ -1,0 +1,2329 @@
+# ============================================================
+#  event.sk — Système d'event de zone (chasse aux trésors)
+#  Auteur: Shamallow_ pour Xeinoria
+#
+#  - Wand: hache en or pour sélectionner la zone de l'event
+#    (clic gauche = pos1, clic droit air = pos2)
+#  - L'event est ouvert via /event start
+#  - Les joueurs rejoignent en s'accroupissant 5x rapidement
+#  - Action bar dynamique:
+#      * hors zone -> direction (flèches) + distance
+#      * dans zone -> consigne "trouvez les 4 trésors"
+#  - Protection blocs configurable (off par défaut)
+#  - Permission unique: event.admin
+# ============================================================
+
+options:
+    prefix: &8[&6Event&8] &r
+    wand_name: &6&lZone Wand
+    sneak_window: 1500       # ms max entre 2 sneaks
+    sneak_needed: 10
+    ab_period: 6 ticks       # période de rafraîchissement action bar + FX (plus fluide)
+    perm: event.admin
+
+# ============================================================
+#  Helpers d'état
+# ============================================================
+
+function eventIsActive() :: boolean:
+    if {event::active} is true:
+        return true
+    return false
+
+function eventSelectionMode() :: text:
+    if {event::region::mode} is "poly":
+        return "poly"
+    return "rect"
+
+function eventHasRectRegion() :: boolean:
+    if {event::region::1} is set:
+        if {event::region::2} is set:
+            return true
+    return false
+
+function eventHasRegion() :: boolean:
+    if eventSelectionMode() is "poly":
+        return eventPolyHasRegion()
+    return eventHasRectRegion()
+
+function eventIsProtect() :: boolean:
+    if {event::protect} is true:
+        return true
+    return false
+
+function eventIsPvp() :: boolean:
+    if {event::pvp} is true:
+        return true
+    return false
+
+function eventIsPve() :: boolean:
+    if {event::pve} is true:
+        return true
+    return false
+
+# Config d'interaction dans la zone (par defaut: autorise)
+function eventCanOpenContainers() :: boolean:
+    if {event::allow::containers} is false:
+        return false
+    return true
+
+function eventCanUseSwitches() :: boolean:
+    if {event::allow::switches} is false:
+        return false
+    return true
+
+function eventCanUseDoors() :: boolean:
+    if {event::allow::doors} is false:
+        return false
+    return true
+
+# Barre d'aide setup (action bar creatif admin), automatique si hache en main.
+# Selection de zone: inclure la hauteur Y (desactive par defaut).
+function eventUseY() :: boolean:
+    if {event::usey} is true:
+        return true
+    return false
+
+function eventYesNo(flag: boolean) :: text:
+    if {_flag} is true:
+        return "&aOui"
+    return "&cNon"
+
+function eventSetUseY(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::usey} to true
+        send "{@prefix}&aLa hauteur Y est maintenant prise en compte dans la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        delete {event::usey}
+        send "{@prefix}&cLa hauteur Y n'est plus prise en compte (zone en colonne X/Z)." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event usey <on|off>" to {_s}
+
+# Bloc cible de la chasse au trésor (configurable). Défaut: tête de joueur.
+function eventTargetType() :: item type:
+    if {event::block} is set:
+        return {event::block}
+    return player head
+
+function eventTargetName() :: text:
+    set {_t} to eventTargetType()
+    return "%{_t}%"
+
+# Compare un type de bloc avec la cible (gère la variante murale des têtes).
+function eventIsTargetBlock(t: item type) :: boolean:
+    set {_target} to eventTargetType()
+    if {_t} is {_target}:
+        return true
+    if {_target} is player head:
+        if {_t} is player wall head:
+            return true
+    return false
+
+function eventIsJoined(p: player) :: boolean:
+    if {event::joined::%uuid of {_p}%} is set:
+        return true
+    return false
+
+function eventIsArrived(p: player) :: boolean:
+    if {event::arrived::%uuid of {_p}%} is true:
+        return true
+    return false
+
+function eventArrivalRadius() :: number:
+    if {event::arrival::radius} is set:
+        return {event::arrival::radius}
+    return 8
+
+function eventArrivalNeedStep() :: boolean:
+    if {event::arrival::needstep} is true:
+        return true
+    return false
+
+function eventArrivalBlockType() :: item type:
+    if {event::arrival::block} is set:
+        return {event::arrival::block}
+    return gold block
+
+function eventArrivalBlockName() :: text:
+    set {_t} to eventArrivalBlockType()
+    return "%{_t}%"
+
+# Prend d'abord le bloc vise (target block), sinon l'item en main.
+function eventPreferredBlockType(p: player) :: item type:
+    set {_tb} to target block of {_p}
+    if {_tb} is set:
+        set {_tt} to type of {_tb}
+        if {_tt} is not air:
+            return {_tt}
+    set {_it} to tool of {_p}
+    if {_it} is set:
+        if {_it} is not air:
+            return type of {_it}
+    return air
+
+function eventArrivalStepOk(p: player) :: boolean:
+    set {_feet} to block below {_p}
+    set {_t} to type of {_feet}
+    if {_t} is eventArrivalBlockType():
+        return true
+    return false
+
+function eventArrivalNearOk(p: player) :: boolean:
+    set {_target} to eventTargetPoint()
+    if world of {_p} is not world of {_target}:
+        return false
+    if eventUseY() is false:
+        set y-coordinate of {_target} to y-coordinate of {_p}
+    set {_dist} to distance between location of {_p} and {_target}
+    if {_dist} <= eventArrivalRadius():
+        return true
+    return false
+
+function eventUpdateArrivalState(p: player):
+    if eventIsJoined({_p}) is false:
+        stop
+    if eventIsArrived({_p}) is true:
+        stop
+    if eventArrivalNearOk({_p}) is true:
+        set metadata value "event_arrival_near" of {_p} to true
+    if eventArrivalNeedStep() is false:
+        set metadata value "event_arrival_step" of {_p} to true
+    else:
+        if eventArrivalStepOk({_p}) is true:
+            set metadata value "event_arrival_step" of {_p} to true
+    if metadata value "event_arrival_near" of {_p} is not true:
+        stop
+    if metadata value "event_arrival_step" of {_p} is not true:
+        stop
+    set {event::arrived::%uuid of {_p}%} to true
+    play sound "minecraft:entity.player.levelup" with volume 0.8 with pitch 1.25 to {_p}
+    send title "&a&lArrivee validee" with subtitle "&7Tu peux maintenant chercher les tresors." to {_p} for 5 ticks, 35 ticks and 10 ticks
+
+function eventClearAllState():
+    delete {event::active}
+    delete {event::protect}
+    delete {event::pvp}
+    delete {event::pve}
+    delete {event::treasures}
+    delete {event::total}
+    delete {event::joined::*}
+    delete {event::arrived::*}
+    delete {event::arrival::near::*}
+    delete {event::arrival::step::*}
+    delete {event::sneakCount::*}
+    delete {event::lastSneak::*}
+    delete {event::inside::*}
+    delete {event::boundaryfx::last::*}
+    loop all players:
+        delete metadata value "event_arrival_near" of loop-player
+        delete metadata value "event_arrival_step" of loop-player
+        delete metadata value "event_inside_zone" of loop-player
+        delete metadata value "event_boundary_last" of loop-player
+
+# ============================================================
+#  Zone: AABB entre les deux positions
+# ============================================================
+
+function eventInRegion(loc: location) :: boolean:
+    if eventHasRegion() is false:
+        return false
+    if eventSelectionMode() is "poly":
+        set {_first} to {event::region::poly::1}
+        if world of {_loc} is not world of {_first}:
+            return false
+        if eventUseY() is true:
+            set {_y} to y-coordinate of {_loc}
+            set {_pMinY} to eventPolyMinY()
+            set {_pMaxY} to eventPolyMaxY()
+            if {_y} < {_pMinY}:
+                return false
+            if {_y} > {_pMaxY} + 1:
+                return false
+        set {_x} to x-coordinate of {_loc}
+        set {_z} to z-coordinate of {_loc}
+        return eventPolyContains2D({_x}, {_z})
+    if world of {_loc} is not world of {event::region::1}:
+        return false
+    set {_x1} to x-coordinate of {event::region::1}
+    set {_x2} to x-coordinate of {event::region::2}
+    set {_y1} to y-coordinate of {event::region::1}
+    set {_y2} to y-coordinate of {event::region::2}
+    set {_z1} to z-coordinate of {event::region::1}
+    set {_z2} to z-coordinate of {event::region::2}
+    set {_minX} to min({_x1}, {_x2})
+    set {_maxX} to max({_x1}, {_x2})
+    set {_minY} to min({_y1}, {_y2})
+    set {_maxY} to max({_y1}, {_y2})
+    set {_minZ} to min({_z1}, {_z2})
+    set {_maxZ} to max({_z1}, {_z2})
+    set {_x} to x-coordinate of {_loc}
+    set {_y} to y-coordinate of {_loc}
+    set {_z} to z-coordinate of {_loc}
+    if {_x} < {_minX}:
+        return false
+    if {_x} > {_maxX} + 1:
+        return false
+    if eventUseY() is true:
+        if {_y} < {_minY}:
+            return false
+        if {_y} > {_maxY} + 1:
+            return false
+    if {_z} < {_minZ}:
+        return false
+    if {_z} > {_maxZ} + 1:
+        return false
+    return true
+
+function eventRegionCenter() :: location:
+    eventHasRegion() is true
+    if eventSelectionMode() is "poly":
+        return eventPolyCenter()
+    set {_x1} to x-coordinate of {event::region::1}
+    set {_x2} to x-coordinate of {event::region::2}
+    set {_y1} to y-coordinate of {event::region::1}
+    set {_y2} to y-coordinate of {event::region::2}
+    set {_z1} to z-coordinate of {event::region::1}
+    set {_z2} to z-coordinate of {event::region::2}
+    set {_cx} to ({_x1} + {_x2}) / 2
+    set {_cy} to ({_y1} + {_y2}) / 2
+    set {_cz} to ({_z1} + {_z2}) / 2
+    set {_w} to world of {event::region::1}
+    set {_c} to location at {_cx}, {_cy}, {_cz} in {_w}
+    return {_c}
+
+# Point de visee personnalise (sinon centre de zone)
+function eventTargetPoint() :: location:
+    if {event::target::loc} is set:
+        return {event::target::loc}
+    return eventRegionCenter()
+
+function eventEnsureTargetPointInRegion(s: player):
+    if {event::target::loc} is not set:
+        stop
+    if eventHasRegion() is false:
+        stop
+    set {_pt} to {event::target::loc}
+    if eventSelectionMode() is "poly":
+        set {_w} to world of {event::region::poly::1}
+    else:
+        set {_w} to world of {event::region::1}
+    if world of {_pt} is not {_w}:
+        delete {event::target::loc}
+        send "{@prefix}&ePoint de visee personnalise retire: hors monde de la zone. Retour au centre." to {_s}
+        stop
+    if eventInRegion({_pt}) is false:
+        delete {event::target::loc}
+        send "{@prefix}&ePoint de visee personnalise retire: hors zone. Retour au centre." to {_s}
+
+# ============================================================
+#  Polygone (mode selection multi-points)
+# ============================================================
+
+function eventPolyCount() :: integer:
+    if {event::region::poly::count} is set:
+        return {event::region::poly::count}
+    return 0
+
+function eventPolyHasRegion() :: boolean:
+    if eventPolyCount() >= 3:
+        return true
+    return false
+
+# Vide totalement la liste des sommets et invalide le cache associe.
+function eventPolyClear():
+    delete {event::region::poly::*}
+    eventPolyClearCache()
+
+# Ajoute un sommet en fin de liste et invalide le cache polygone.
+function eventPolyAdd(loc: location) :: boolean:
+    set {_n} to eventPolyCount()
+    # Verifie la collinearite avec les 2 derniers sommets: si V(n-1), Vn, Vnew sont
+    # alignes, le nouveau sommet ne cree aucun coin — on deplace Vn vers Vnew plutot
+    # que d'ajouter un point intermediaire inutile.
+    if {_n} >= 2:
+        set {_prev_idx} to {_n} - 1
+        set {_v_prev} to {event::region::poly::%{_prev_idx}%}
+        set {_v_last} to {event::region::poly::%{_n}%}
+        if {_v_prev} is set:
+            if {_v_last} is set:
+                set {_ax} to floor(x-coordinate of {_v_prev})
+                set {_az} to floor(z-coordinate of {_v_prev})
+                set {_bx} to floor(x-coordinate of {_v_last})
+                set {_bz} to floor(z-coordinate of {_v_last})
+                set {_cx} to floor(x-coordinate of {_loc})
+                set {_cz} to floor(z-coordinate of {_loc})
+                set {_cross} to ({_bx} - {_ax}) * ({_cz} - {_az}) - ({_bz} - {_az}) * ({_cx} - {_ax})
+                if {_cross} is 0:
+                    # Colineaire: on deplace le dernier sommet vers le nouveau point
+                    # (conserve l'extremite de l'arete sans multiplier les sommets).
+                    set {event::region::poly::%{_n}%} to {_loc}
+                    set {event::region::poly::version} to 3
+                    eventPolyInvalidateCache()
+                    return false
+    # Ajout normal d'un nouveau sommet.
+    set {_n2} to {_n} + 1
+    set {event::region::poly::%{_n2}%} to {_loc}
+    set {event::region::poly::count} to {_n2}
+    set {event::region::poly::version} to 3
+    eventPolyInvalidateCache()
+    return true
+
+# Rollback de la tentative d'offset +0.5 : on remet les sommets aux coins
+# entiers des blocs cliqués (sem antique d'origine).
+on script load:
+    if {event::region::poly::count} is set:
+        if {event::region::poly::version} is 2:
+            set {_n} to {event::region::poly::count}
+            set {_i} to 1
+            while {_i} <= {_n}:
+                set {_v} to {event::region::poly::%{_i}%}
+                if {_v} is set:
+                    set {_w} to world of {_v}
+                    set {_nv} to location at (x-coordinate of {_v}) - 0.5, y-coordinate of {_v}, (z-coordinate of {_v}) - 0.5 in {_w}
+                    set {event::region::poly::%{_i}%} to {_nv}
+                add 1 to {_i}
+            set {event::region::poly::version} to 3
+    # Invalide systematiquement le cache au demarrage (un reload peut changer l'algo).
+    # Purge les anciennes variables individuelles wcell/icell/wseen (ancienne structure).
+    delete {event::cache::poly::wcell::*}
+    delete {event::cache::poly::icell::*}
+    delete {event::cache::poly::wseen::*}
+    delete {event::boundaryfx::faceframe::*}
+    delete {event::boundaryfx::last::*}
+    eventPolyInvalidateCache()
+
+# Retire le dernier sommet et invalide le cache polygone.
+function eventPolyRemoveLast() :: boolean:
+    set {_n} to eventPolyCount()
+    if {_n} <= 0:
+        return false
+    delete {event::region::poly::%{_n}%}
+    if {_n} <= 1:
+        delete {event::region::poly::count}
+    else:
+        set {event::region::poly::count} to {_n} - 1
+    eventPolyInvalidateCache()
+    return true
+
+# Point-in-polygon (XZ) via ray casting horizontal
+function eventPolyContains2D(x: number, z: number) :: boolean:
+    set {_n} to eventPolyCount()
+    if {_n} < 3:
+        return false
+    set {_inside} to false
+    set {_i} to 1
+    set {_j} to {_n}
+    while {_i} <= {_n}:
+        set {_xi} to x-coordinate of {event::region::poly::%{_i}%}
+        set {_zi} to z-coordinate of {event::region::poly::%{_i}%}
+        set {_xj} to x-coordinate of {event::region::poly::%{_j}%}
+        set {_zj} to z-coordinate of {event::region::poly::%{_j}%}
+        set {_a} to false
+        set {_b} to false
+        if {_zi} > {_z}:
+            set {_a} to true
+        if {_zj} > {_z}:
+            set {_b} to true
+        if {_a} is not {_b}:
+            set {_dz} to {_zj} - {_zi}
+            if {_dz} is not 0:
+                set {_slope} to ({_xj} - {_xi}) * ({_z} - {_zi}) / {_dz} + {_xi}
+                if {_x} < {_slope}:
+                    if {_inside} is true:
+                        set {_inside} to false
+                    else:
+                        set {_inside} to true
+        set {_j} to {_i}
+        add 1 to {_i}
+    return {_inside}
+
+function eventPolyMinY() :: number:
+    set {_n} to eventPolyCount()
+    if {_n} <= 0:
+        return 0
+    set {_m} to y-coordinate of {event::region::poly::1}
+    set {_i} to 2
+    while {_i} <= {_n}:
+        set {_yi} to y-coordinate of {event::region::poly::%{_i}%}
+        if {_yi} < {_m}:
+            set {_m} to {_yi}
+        add 1 to {_i}
+    return floor({_m})
+
+function eventPolyMaxY() :: number:
+    set {_n} to eventPolyCount()
+    if {_n} <= 0:
+        return 0
+    set {_m} to y-coordinate of {event::region::poly::1}
+    set {_i} to 2
+    while {_i} <= {_n}:
+        set {_yi} to y-coordinate of {event::region::poly::%{_i}%}
+        if {_yi} > {_m}:
+            set {_m} to {_yi}
+        add 1 to {_i}
+    return floor({_m})
+
+function eventPolySignedArea() :: number:
+    set {_n} to eventPolyCount()
+    if {_n} < 3:
+        return 0
+    set {_sum} to 0
+    set {_i} to 1
+    while {_i} <= {_n}:
+        if {_i} = {_n}:
+            set {_jj} to 1
+        else:
+            set {_jj} to {_i} + 1
+        set {_xi} to x-coordinate of {event::region::poly::%{_i}%}
+        set {_zi} to z-coordinate of {event::region::poly::%{_i}%}
+        set {_xj} to x-coordinate of {event::region::poly::%{_jj}%}
+        set {_zj} to z-coordinate of {event::region::poly::%{_jj}%}
+        set {_sum} to {_sum} + {_xi} * {_zj} - {_xj} * {_zi}
+        add 1 to {_i}
+    return {_sum}
+
+# ============================================================
+#  Cache polygone (perf): bbox + signed area + cellules de mur
+#  + cellules interieures. Rebuild uniquement quand le polygone
+#  change, sinon on relit le cache directement (tres rapide).
+# ============================================================
+
+# Marque le cache polygone comme obsolete (rebuild au prochain acces).
+function eventPolyInvalidateCache():
+    delete {event::cache::poly::*}
+    set {event::cache::poly::dirty} to true
+
+# Vide totalement le cache polygone et libere la memoire associee.
+function eventPolyClearCache():
+    delete {event::cache::poly::*}
+
+# Reconstruit l'integralite du cache polygone en une seule passe.
+# Appele uniquement via eventPolyEnsureCache lorsque le cache est dirty.
+function eventPolyBuildCache():
+    delete {event::cache::poly::*}
+    set {event::cache::poly::dirty} to false
+    set {_n} to {event::region::poly::count}
+    if {_n} is not set:
+        set {event::cache::poly::n} to 0
+        stop
+    if {_n} < 3:
+        set {event::cache::poly::n} to {_n}
+        stop
+    set {event::cache::poly::n} to {_n}
+    # Bounding box XZ + bornes Y a partir des sommets
+    set {_minX} to x-coordinate of {event::region::poly::1}
+    set {_maxX} to {_minX}
+    set {_minZ} to z-coordinate of {event::region::poly::1}
+    set {_maxZ} to {_minZ}
+    set {_minY} to y-coordinate of {event::region::poly::1}
+    set {_maxY} to {_minY}
+    set {_i} to 2
+    while {_i} <= {_n}:
+        set {_xi} to x-coordinate of {event::region::poly::%{_i}%}
+        set {_yi} to y-coordinate of {event::region::poly::%{_i}%}
+        set {_zi} to z-coordinate of {event::region::poly::%{_i}%}
+        if {_xi} < {_minX}:
+            set {_minX} to {_xi}
+        if {_xi} > {_maxX}:
+            set {_maxX} to {_xi}
+        if {_zi} < {_minZ}:
+            set {_minZ} to {_zi}
+        if {_zi} > {_maxZ}:
+            set {_maxZ} to {_zi}
+        if {_yi} < {_minY}:
+            set {_minY} to {_yi}
+        if {_yi} > {_maxY}:
+            set {_maxY} to {_yi}
+        add 1 to {_i}
+    set {event::cache::poly::minX} to floor({_minX})
+    set {event::cache::poly::maxX} to floor({_maxX})
+    set {event::cache::poly::minZ} to floor({_minZ})
+    set {event::cache::poly::maxZ} to floor({_maxZ})
+    set {event::cache::poly::minY} to floor({_minY})
+    set {event::cache::poly::maxY} to floor({_maxY})
+    set {_sizeX} to {event::cache::poly::maxX} - {event::cache::poly::minX} + 1
+    set {_sizeZ} to {event::cache::poly::maxZ} - {event::cache::poly::minZ} + 1
+    set {_bboxCells} to {_sizeX} * {_sizeZ}
+    if {event::cache::poly::maxInteriorCells} is set:
+        set {_maxInterior} to {event::cache::poly::maxInteriorCells}
+    else:
+        set {_maxInterior} to 40000
+    if {_maxInterior} < 1000:
+        set {_maxInterior} to 1000
+    # Aire signee (oriente -> direction des normales exterieures)
+    set {_area} to 0
+    set {_i} to 1
+    while {_i} <= {_n}:
+        if {_i} = {_n}:
+            set {_j} to 1
+        else:
+            set {_j} to {_i} + 1
+        set {_xi} to x-coordinate of {event::region::poly::%{_i}%}
+        set {_zi} to z-coordinate of {event::region::poly::%{_i}%}
+        set {_xj} to x-coordinate of {event::region::poly::%{_j}%}
+        set {_zj} to z-coordinate of {event::region::poly::%{_j}%}
+        set {_area} to {_area} + {_xi} * {_zj} - {_xj} * {_zi}
+        add 1 to {_i}
+    set {event::cache::poly::area} to {_area}
+    if {_area} >= 0:
+        set {_outwardSign} to 1
+    else:
+        set {_outwardSign} to -1
+    set {_negSign} to 0 - {_outwardSign}
+    # Les cellules de mur sont desormais calculees a la volee pendant le rendu
+    # (eventShowBoundaryFxPolyFor): aucune limite de perimetre, seules les aretes
+    # proches du joueur sont traitees (quick-reject par arete).
+    # Cellules interieures (sol/plafond) uniquement utiles en mode useY ON.
+    # Stockage en liste locale puis join en une seule string packed -> 1 variable disque
+    set {_ic} to 0
+    if eventUseY() is true:
+        if {_bboxCells} <= {_maxInterior}:
+            set {_xx} to {event::cache::poly::minX}
+            while {_xx} <= {event::cache::poly::maxX}:
+                set {_zz} to {event::cache::poly::minZ}
+                while {_zz} <= {event::cache::poly::maxZ}:
+                    if eventPolyContains2D({_xx} + 0.5, {_zz} + 0.5) is true:
+                        add 1 to {_ic}
+                        set {_ilist::%{_ic}%} to "%{_xx}% %{_zz}%"
+                    add 1 to {_zz}
+                add 1 to {_xx}
+            set {event::cache::poly::insideSkipped} to false
+        else:
+            # Garde-fou anti-freeze: on saute le scan interieur trop grand.
+            set {event::cache::poly::insideSkipped} to true
+    else:
+        set {event::cache::poly::insideSkipped} to true
+    set {event::cache::poly::icount} to {_ic}
+    # Packer les cellules interieur en une seule variable persistee
+    if {_ic} > 0:
+        set {event::cache::poly::ipacked} to join {_ilist::*} with ";"
+    else:
+        set {event::cache::poly::ipacked} to ""
+
+# Garantit que le cache polygone est a jour avant utilisation.
+function eventPolyEnsureCache():
+    set {_needsBuild} to false
+    if {event::cache::poly::dirty} is true:
+        set {_needsBuild} to true
+    if {event::cache::poly::n} is not set:
+        set {_needsBuild} to true
+    if {_needsBuild} is true:
+        eventPolyBuildCache()
+
+function eventPolyCenter() :: location:
+    set {_n} to eventPolyCount()
+    set {_w} to world of {event::region::poly::1}
+    if {_n} <= 0:
+        return location at 0, 0, 0 in {_w}
+    set {_sx} to 0
+    set {_sz} to 0
+    set {_i} to 1
+    while {_i} <= {_n}:
+        set {_sx} to {_sx} + x-coordinate of {event::region::poly::%{_i}%}
+        set {_sz} to {_sz} + z-coordinate of {event::region::poly::%{_i}%}
+        add 1 to {_i}
+    set {_cx} to {_sx} / {_n}
+    set {_cz} to {_sz} / {_n}
+    if eventUseY() is true:
+        set {_cy} to (eventPolyMinY() + eventPolyMaxY() + 1) / 2
+    else:
+        set {_cy} to y-coordinate of {event::region::poly::1}
+    return location at {_cx}, {_cy}, {_cz} in {_w}
+
+# Scanne la zone et retourne le nombre de blocs cibles présents.
+# Utilise une boucle 3D bornée par les coordonnées entières.
+function eventScanZone() :: integer:
+    if eventHasRegion() is false:
+        return 0
+    if eventSelectionMode() is "poly":
+        set {_w} to world of {event::region::poly::1}
+        set {_n} to eventPolyCount()
+        set {_minX} to floor(x-coordinate of {event::region::poly::1})
+        set {_maxX} to {_minX}
+        set {_minZ} to floor(z-coordinate of {event::region::poly::1})
+        set {_maxZ} to {_minZ}
+        set {_i} to 2
+        while {_i} <= {_n}:
+            set {_xi} to floor(x-coordinate of {event::region::poly::%{_i}%})
+            set {_zi} to floor(z-coordinate of {event::region::poly::%{_i}%})
+            if {_xi} < {_minX}:
+                set {_minX} to {_xi}
+            if {_xi} > {_maxX}:
+                set {_maxX} to {_xi}
+            if {_zi} < {_minZ}:
+                set {_minZ} to {_zi}
+            if {_zi} > {_maxZ}:
+                set {_maxZ} to {_zi}
+            add 1 to {_i}
+        set {_minY} to eventPolyMinY()
+        set {_maxY} to eventPolyMaxY()
+        set {_count} to 0
+        loop integers from {_minX} to {_maxX}:
+            set {_x} to loop-value
+            loop integers from {_minZ} to {_maxZ}:
+                set {_z} to loop-value-2
+                if eventPolyContains2D({_x} + 0.5, {_z} + 0.5) is true:
+                    loop integers from {_minY} to {_maxY}:
+                        set {_y} to loop-value-3
+                        set {_b} to block at location({_x}, {_y}, {_z}, {_w})
+                        if eventIsTargetBlock(type of {_b}) is true:
+                            add 1 to {_count}
+        return {_count}
+    set {_x1} to x-coordinate of {event::region::1}
+    set {_x2} to x-coordinate of {event::region::2}
+    set {_y1} to y-coordinate of {event::region::1}
+    set {_y2} to y-coordinate of {event::region::2}
+    set {_z1} to z-coordinate of {event::region::1}
+    set {_z2} to z-coordinate of {event::region::2}
+    set {_minX} to floor(min({_x1}, {_x2}))
+    set {_maxX} to floor(max({_x1}, {_x2}))
+    set {_minY} to floor(min({_y1}, {_y2}))
+    set {_maxY} to floor(max({_y1}, {_y2}))
+    set {_minZ} to floor(min({_z1}, {_z2}))
+    set {_maxZ} to floor(max({_z1}, {_z2}))
+    set {_w} to world of {event::region::1}
+    set {_count} to 0
+    loop integers from {_minX} to {_maxX}:
+        set {_x} to loop-value
+        loop integers from {_minY} to {_maxY}:
+            set {_y} to loop-value-2
+            loop integers from {_minZ} to {_maxZ}:
+                set {_z} to loop-value-3
+                set {_b} to block at location({_x}, {_y}, {_z}, {_w})
+                if eventIsTargetBlock(type of {_b}) is true:
+                    add 1 to {_count}
+    return {_count}
+
+# ============================================================
+#  Wand
+# ============================================================
+
+function eventCreateWand() :: item:
+    set {_w} to golden axe
+    set display name of {_w} to "{@wand_name}"
+    set lore of {_w} to "&7Clic gauche &8» &fpos1", "&7Clic droit &8» &fpos2", "", "&8Outil event - admin"
+    return {_w}
+
+function eventIsWand(it: item) :: boolean:
+    if {_it} is not a golden axe:
+        return false
+    set {_n} to display name of {_it}
+    if {_n} is not set:
+        return false
+    if uncolored {_n} is not uncolored "{@wand_name}":
+        return false
+    return true
+
+function eventGiveWand(p: player):
+    give {_p} eventCreateWand()
+    send "{@prefix}&aWand reçu. &7Clic gauche=pos1, clic droit=pos2." to {_p}
+
+# ============================================================
+#  Direction: yaw -> flèche unicode
+# ============================================================
+
+function eventArrow(player_yaw: number, from: location, to: location) :: text:
+    set {_dx} to x-coordinate of {_to} - x-coordinate of {_from}
+    set {_dz} to z-coordinate of {_to} - z-coordinate of {_from}
+    set {_negDx} to 0 - {_dx}
+    # yaw cible (Bukkit: yaw = atan2(-dx, dz) en convention Java atan2(y,x);
+    # Skript expose atan2(x, y) donc on inverse l'ordre)
+    set {_targetYaw} to atan2({_dz}, {_negDx})
+    set {_rel} to {_targetYaw} - {_player_yaw}
+    # normaliser dans [-180, 180]
+    while {_rel} > 180:
+        set {_rel} to {_rel} - 360
+    while {_rel} < -180:
+        set {_rel} to {_rel} + 360
+    if {_rel} >= -22.5:
+        if {_rel} < 22.5:
+            return "&e⬆"
+    if {_rel} >= 22.5:
+        if {_rel} < 67.5:
+            return "&e⬈"
+    if {_rel} >= 67.5:
+        if {_rel} < 112.5:
+            return "&e➡"
+    if {_rel} >= 112.5:
+        if {_rel} < 157.5:
+            return "&e⬊"
+    if {_rel} >= 157.5:
+        return "&e⬇"
+    if {_rel} <= -157.5:
+        return "&e⬇"
+    if {_rel} <= -112.5:
+        return "&e⬋"
+    if {_rel} <= -67.5:
+        return "&e⬅"
+    if {_rel} <= -22.5:
+        return "&e⬉"
+    return "&e•"
+
+# ============================================================
+#  Action bar
+# ============================================================
+
+function eventActionBarFor(p: player):
+    if eventIsActive() is false:
+        stop
+    if eventIsJoined({_p}) is false:
+        stop
+    eventUpdateArrivalState({_p})
+    if eventIsArrived({_p}) is false:
+        set {_targetLoc} to eventTargetPoint()
+        if world of {_p} is not world of {_targetLoc}:
+            send action bar "&cChangez de monde pour valider l'arrivee." to {_p}
+            stop
+        set {_arrow} to eventArrow(yaw of {_p}, location of {_p}, {_targetLoc})
+        set {_dist} to distance between location of {_p} and {_targetLoc}
+        set {_dr} to round({_dist})
+        if metadata value "event_arrival_near" of {_p} is true:
+            set {_nearTxt} to "&aOK"
+        else:
+            set {_nearTxt} to "&cA faire"
+        if eventArrivalNeedStep() is true:
+            if metadata value "event_arrival_step" of {_p} is true:
+                set {_stepTxt} to "&aOK"
+            else:
+                set {_stepTxt} to "&cA faire"
+            send action bar "&eArrivee &8| &7Proche: %{_nearTxt}% &8| &7Bloc &6%eventArrivalBlockName()%: %{_stepTxt}% &8| %{_arrow}% &f%{_dr}%m" to {_p}
+            stop
+        send action bar "&eArrivee &8| &7Proche: %{_nearTxt}% &8| %{_arrow}% &f%{_dr}%m" to {_p}
+        stop
+    set {_loc} to location of {_p}
+    set {_targetLoc} to eventTargetPoint()
+    if eventInRegion({_loc}) is true:
+        set {_total} to {event::total}
+        if {_total} is not set:
+            set {_total} to 0
+        set {_found} to {event::treasures}
+        if {_found} is not set:
+            set {_found} to 0
+        set {_remaining} to {_total} - {_found}
+        if {_remaining} < 0:
+            set {_remaining} to 0
+        if metadata value "event_inside_zone" of {_p} is not true:
+            set metadata value "event_inside_zone" of {_p} to true
+            play sound "minecraft:block.beacon.activate" with volume 0.7 with pitch 1.4 to {_p}
+            send title "&6&l✦ Zone atteinte ✦" with subtitle "&eTrouvez les &6%{_remaining}% trésors &e!" to {_p} for 5 ticks, 40 ticks and 10 ticks
+        if world of {_p} is world of {_targetLoc}:
+            set {_arrow} to eventArrow(yaw of {_p}, location of {_p}, {_targetLoc})
+            set {_dist} to distance between location of {_p} and {_targetLoc}
+            set {_dr} to round({_dist})
+            send action bar "&6✦ &eTrouvez les &6%{_remaining}% trésors &erestants &7(&e%{_found}%&7/&e%{_total}%&7) &8| %{_arrow}% &f%{_dr}%m &6✦" to {_p}
+            stop
+        send action bar "&6✦ &eTrouvez les &6%{_remaining}% trésors &erestants &7(&e%{_found}%&7/&e%{_total}%&7) &6✦" to {_p}
+    else:
+        if metadata value "event_inside_zone" of {_p} is true:
+            delete metadata value "event_inside_zone" of {_p}
+        if world of {_p} is not world of {_targetLoc}:
+            send action bar "&cChangez de monde pour rejoindre la zone d'event." to {_p}
+            stop
+        set {_arrow} to eventArrow(yaw of {_p}, location of {_p}, {_targetLoc})
+        set {_dist} to distance between location of {_p} and {_targetLoc}
+        set {_d} to "%{_dist}%" parsed as number
+        if {_d} is not set:
+            set {_d} to 0
+        set {_dr} to round({_d})
+        send action bar "%{_arrow}% &fDirection zone event &7(&e%{_dr}%&7m)" to {_p}
+
+# Affiche une action bar d'aide setup (admin + baguette), avec distance au point vise.
+function eventBuildAssistBar(p: player):
+    if eventIsWand(tool of {_p}) is false:
+        stop
+    if {_p} has permission "{@perm}":
+        if gamemode of {_p} is creative:
+            if eventHasRegion() is false:
+                send action bar "&6[Event-Setup] &7Zone: &cnon definie" to {_p}
+                stop
+            set {_in} to eventInRegion(location of {_p})
+            set {_yn} to eventYesNo({_in})
+            set {_point} to eventTargetPoint()
+            if world of {_p} is world of {_point}:
+                set {_arrow} to eventArrow(yaw of {_p}, location of {_p}, {_point})
+                set {_dist} to distance between location of {_p} and {_point}
+                set {_dr} to round({_dist})
+                send action bar "&6[Event-Setup] &7Dans zone: %{_yn}% &8| &7Point vise: %{_arrow}% &f%{_dr}%m" to {_p}
+                stop
+            send action bar "&6[Event-Setup] &7Dans zone: %{_yn}% &8| &7Point vise: &cautre monde" to {_p}
+
+# Rend une particule standard de mur (orange) sur une cellule de bordure.
+function eventBoundaryParticleAt(p: player, x: number, y: number, z: number):
+    set {_lx} to {_x} + 0.5
+    set {_ly} to {_y} + 0.15
+    set {_lz} to {_z} + 0.5
+    set {_l} to location at {_lx}, {_ly}, {_lz} in world of {_p}
+    draw 3 of dust using dustOption(orange, 2.2) at {_l} with offset vector(0, 0, 0) with extra 0 for {_p}
+
+# Rend une particule d'angle (rouge) sur une cellule de sommet.
+function eventBoundaryCornerParticleAt(p: player, x: number, y: number, z: number):
+    set {_lx} to {_x} + 0.5
+    set {_ly} to {_y} + 0.15
+    set {_lz} to {_z} + 0.5
+    set {_l} to location at {_lx}, {_ly}, {_lz} in world of {_p}
+    draw 4 of dust using dustOption(red, 2.25) at {_l} with offset vector(0, 0, 0) with extra 0 for {_p}
+
+# Rend la particule de clic de sommet (bleu) exactement au Y du bloc clique.
+function eventBoundaryCornerClickParticleAt(p: player, x: number, y: number, z: number):
+    set {_lx} to {_x} + 0.5
+    set {_ly} to {_y} + 0.15
+    set {_lz} to {_z} + 0.5
+    set {_l} to location at {_lx}, {_ly}, {_lz} in world of {_p}
+    draw 5 of dust using dustOption(aqua, 2.35) at {_l} with offset vector(0, 0, 0) with extra 0 for {_p}
+
+# Rend un marqueur doux sur le point vise si proche du joueur/admin.
+function eventTargetPointParticleFor(p: player, center: location, radius: number):
+    if eventHasRegion() is false:
+        stop
+    set {_t} to eventTargetPoint()
+    if {_t} is not set:
+        stop
+    if world of {_p} is not world of {_t}:
+        stop
+    if distance between {_center} and {_t} > {_radius} + 4:
+        stop
+    set {_m} to {_t}
+    add 0.35 to y-coordinate of {_m}
+    draw 8 of dust using dustOption(aqua, 1.5) at {_m} with offset vector(0.12, 0.12, 0.12) with extra 0 for {_p}
+
+# Intervalle minimal entre deux rafraichissements FX d'un meme joueur.
+function eventBoundaryMinInterval() :: timespan:
+    return 700 milliseconds
+
+# Throttle par joueur pour eviter un spam de particules a chaque tick.
+function eventBoundaryCanRenderNow(p: player) :: boolean:
+    if metadata value "event_boundary_last" of {_p} is set:
+        set {_elapsed} to difference between metadata value "event_boundary_last" of {_p} and now
+        if {_elapsed} is less than eventBoundaryMinInterval():
+            return false
+    set metadata value "event_boundary_last" of {_p} to now
+    return true
+
+# Rayon horizontal de rendu des particules de frontiere.
+function eventBoundaryRenderRadius() :: number:
+    if {event::boundaryfx::radius} is set:
+        return {event::boundaryfx::radius}
+    return 24
+
+# Densite (%) des particules de faces (orange). Plus bas = rendu plus leger.
+function eventBoundaryFaceDensityPercent() :: number:
+    if {event::boundaryfx::density} is set:
+        set {_d} to {event::boundaryfx::density}
+    else:
+        set {_d} to 10
+    if {_d} < 5:
+        set {_d} to 5
+    if {_d} > 100:
+        set {_d} to 100
+    return {_d}
+
+# Fenetre verticale locale (mode 2D/useY OFF): limite les particules sous le joueur.
+function eventBoundaryBelowBlocksLocal() :: number:
+    return 2
+
+# Fenetre verticale locale (mode 2D/useY OFF): garde un peu de hauteur au-dessus.
+function eventBoundaryAboveBlocksLocal() :: number:
+    return 7
+
+# Gate pseudo-aleatoire spatial: repartit les points sur toute la surface,
+# independamment de l'ordre de boucle (evite les paquets "tout a gauche").
+function eventBoundaryPassesFaceSampling(p: player, x: number, y: number, z: number) :: boolean:
+    set {_density} to eventBoundaryFaceDensityPercent()
+    if {_density} >= 100:
+        return true
+    set {_roll} to random integer between 1 and 100
+    if {_roll} <= {_density}:
+        return true
+    return false
+
+# Ouvre une nouvelle frame de rendu orange pour un joueur (seed de dispersion).
+function eventBoundaryInitFaceFrame(p: player):
+    # Plus de seed persistante: sampling deja pseudo-aleatoire via random integer.
+    stop
+
+# Hauteur nominale des colonnes de mur en mode rendu local.
+function eventBoundaryWallHeight() :: number:
+    if {event::boundaryfx::height} is set:
+        return {event::boundaryfx::height}
+    return 32
+
+# Rayon vertical de rendu autour du joueur (mode 3D/useY).
+function eventBoundaryVerticalRadius() :: number:
+    if {event::boundaryfx::vradius} is set:
+        return {event::boundaryfx::vradius}
+    set {_v} to round(eventBoundaryWallHeight() * 0.8)
+    if {_v} < 16:
+        set {_v} to 16
+    return {_v}
+
+# Check de visibilite local (cylindre): distance horizontale au carre + limite Y optionnelle.
+function eventBoundaryVisible(center: location, x: number, y: number, z: number, radiusSq: number, vradius: number) :: boolean:
+    set {_dx} to {_x} + 0.5 - x-coordinate of {_center}
+    set {_dz} to {_z} + 0.5 - z-coordinate of {_center}
+    set {_flatD2} to {_dx} * {_dx} + {_dz} * {_dz}
+    if {_flatD2} > {_radiusSq}:
+        return false
+    if {_vradius} >= 0:
+        set {_dy} to abs(({_y} + 0.15) - y-coordinate of {_center})
+        if {_dy} > {_vradius}:
+            return false
+    return true
+
+# Rendu d'une cellule de mur standard, avec filtre de visibilite local.
+function eventBoundaryTryRender(p: player, x: number, y: number, z: number, center: location, radiusSq: number, vradius: number):
+    if eventBoundaryPassesFaceSampling({_p}, {_x}, {_y}, {_z}) is false:
+        stop
+    if eventBoundaryVisible({_center}, {_x}, {_y}, {_z}, {_radiusSq}, {_vradius}) is false:
+        stop
+    eventBoundaryParticleAt({_p}, {_x}, {_y}, {_z})
+
+# Rendu d'une cellule d'angle rouge, avec filtre de visibilite local.
+function eventBoundaryTryRenderCorner(p: player, x: number, y: number, z: number, center: location, radiusSq: number, vradius: number):
+    if eventBoundaryVisible({_center}, {_x}, {_y}, {_z}, {_radiusSq}, {_vradius}) is false:
+        stop
+    eventBoundaryCornerParticleAt({_p}, {_x}, {_y}, {_z})
+
+# Rendu d'une cellule d'angle bleu (niveau du clic), avec filtre local.
+function eventBoundaryTryRenderCornerClick(p: player, x: number, y: number, z: number, center: location, radiusSq: number, vradius: number):
+    if eventBoundaryVisible({_center}, {_x}, {_y}, {_z}, {_radiusSq}, {_vradius}) is false:
+        stop
+    eventBoundaryCornerClickParticleAt({_p}, {_x}, {_y}, {_z})
+
+# Detecte si une cellule de mur touche l'interieur du polygone (5 echantillons).
+function eventPolyCellTouchesInterior(cellX: number, cellZ: number) :: boolean:
+    if eventPolyContains2D({_cellX} + 0.5, {_cellZ} + 0.5) is true:
+        return true
+    if eventPolyContains2D({_cellX} + 0.15, {_cellZ} + 0.15) is true:
+        return true
+    if eventPolyContains2D({_cellX} + 0.85, {_cellZ} + 0.15) is true:
+        return true
+    if eventPolyContains2D({_cellX} + 0.15, {_cellZ} + 0.85) is true:
+        return true
+    if eventPolyContains2D({_cellX} + 0.85, {_cellZ} + 0.85) is true:
+        return true
+    return false
+
+# Rend la colonne d'un sommet de polygone: bleu au Y clique, rouge ailleurs.
+function eventRenderPolyCornerColumn(p: player, vx: number, vy: number, vz: number, minY: number, maxY: number, center: location, radiusSq: number, vradius: number):
+    loop integers from {_minY} to {_maxY}:
+        set {_yy} to loop-value
+        if {_yy} is {_vy}:
+            eventBoundaryTryRenderCornerClick({_p}, {_vx}, {_yy}, {_vz}, {_center}, {_radiusSq}, {_vradius})
+        else:
+            eventBoundaryTryRenderCorner({_p}, {_vx}, {_yy}, {_vz}, {_center}, {_radiusSq}, {_vradius})
+
+# Rend la frontiere d'un polygone (murs + angles + cible), via le cache pre-calcule.
+# La geometrie (bbox, aire signee, cellules de mur, cellules interieures) est lue
+# depuis {event::cache::poly::*}, recalculee uniquement si invalidee par une modif.
+function eventShowBoundaryFxPolyFor(p: player):
+    eventBoundaryInitFaceFrame({_p})
+    eventPolyEnsureCache()
+    set {_n} to {event::cache::poly::n}
+    if {_n} is not set:
+        stop
+    if {_n} < 3:
+        stop
+    set {_polyMinX} to {event::cache::poly::minX}
+    set {_polyMaxX} to {event::cache::poly::maxX}
+    set {_polyMinZ} to {event::cache::poly::minZ}
+    set {_polyMaxZ} to {event::cache::poly::maxZ}
+    set {_px} to x-coordinate of {_p}
+    set {_py} to y-coordinate of {_p}
+    set {_pz} to z-coordinate of {_p}
+    set {_r} to eventBoundaryRenderRadius()
+    set {_r2} to {_r} * {_r}
+    set {_c} to location of {_p}
+    set {_below} to eventBoundaryBelowBlocksLocal()
+    set {_above} to eventBoundaryAboveBlocksLocal()
+    set {_useY} to eventUseY()
+    if {_useY} is true:
+        set {_minY} to {event::cache::poly::minY}
+        set {_maxY} to {event::cache::poly::maxY} + 1
+        set {_vr} to eventBoundaryVerticalRadius()
+    else:
+        set {_minY} to floor({_py}) - {_below}
+        set {_maxY} to floor({_py}) + {_above}
+        set {_vr} to -1
+    set {_outerMinY} to {_minY} - 1
+    set {_outerMaxY} to {_maxY} + 1
+    # Early-out: joueur trop eloigne pour voir le moindre mur.
+    set {_skip} to false
+    if {_px} < {_polyMinX} - {_r} - 1:
+        set {_skip} to true
+    if {_px} > {_polyMaxX} + {_r} + 1:
+        set {_skip} to true
+    if {_pz} < {_polyMinZ} - {_r} - 1:
+        set {_skip} to true
+    if {_pz} > {_polyMaxZ} + {_r} + 1:
+        set {_skip} to true
+    if {_vr} >= 0:
+        if {_py} < {_minY} - {_vr} - 1:
+            set {_skip} to true
+        if {_py} > {_maxY} + {_vr} + 1:
+            set {_skip} to true
+    if {_skip} is true:
+        stop
+    # Murs verticaux: calcul a la volee depuis les aretes (aucune limite de taille).
+    # Quick-reject par arete: si le milieu est a plus de (r + len/2 + 2) du joueur, skip.
+    set {_neighborSq} to ({_r} + 1) * ({_r} + 1)
+    set {_wOutSign} to 1
+    if {event::cache::poly::area} is set:
+        if {event::cache::poly::area} < 0:
+            set {_wOutSign} to -1
+    set {_wNegSign} to 0 - {_wOutSign}
+    set {_wi} to 1
+    while {_wi} <= {_n}:
+        if {_wi} = {_n}:
+            set {_wjj} to 1
+        else:
+            set {_wjj} to {_wi} + 1
+        set {_exa} to floor(x-coordinate of {event::region::poly::%{_wi}%})
+        set {_eza} to floor(z-coordinate of {event::region::poly::%{_wi}%})
+        set {_exb} to floor(x-coordinate of {event::region::poly::%{_wjj}%})
+        set {_ezb} to floor(z-coordinate of {event::region::poly::%{_wjj}%})
+        set {_wdx} to {_exb} - {_exa}
+        set {_wdz} to {_ezb} - {_eza}
+        set {_wlen} to sqrt({_wdx} * {_wdx} + {_wdz} * {_wdz})
+        if {_wlen} > 0:
+            set {_wmx} to ({_exa} + {_exb}) / 2
+            set {_wmz} to ({_eza} + {_ezb}) / 2
+            set {_wqx} to {_wmx} - {_px}
+            set {_wqz} to {_wmz} - {_pz}
+            set {_wmd2} to {_wqx} * {_wqx} + {_wqz} * {_wqz}
+            set {_wre} to {_r} + {_wlen} / 2 + 2
+            if {_wmd2} <= {_wre} * {_wre}:
+                set {_wudx} to {_wdx} / {_wlen}
+                set {_wudz} to {_wdz} / {_wlen}
+                set {_wnx} to {_wOutSign} * {_wudz}
+                set {_wnz} to {_wNegSign} * {_wudx}
+                if abs({_wdx}) >= abs({_wdz}):
+                    set {_wsteps} to ceil(abs({_wdx}))
+                else:
+                    set {_wsteps} to ceil(abs({_wdz}))
+                if {_wsteps} < 1:
+                    set {_wsteps} to 1
+                set {_wk} to 0
+                while {_wk} <= {_wsteps}:
+                    set {_wt} to {_wk} / {_wsteps}
+                    set {_wcx} to floor({_exa} + {_wt} * {_wdx} + {_wnx})
+                    set {_wcz} to floor({_eza} + {_wt} * {_wdz} + {_wnz})
+                    set {_wfx} to {_wcx} + 0.5 - {_px}
+                    set {_wfz} to {_wcz} + 0.5 - {_pz}
+                    if {_wfx} * {_wfx} + {_wfz} * {_wfz} <= {_neighborSq}:
+                        set {_wkey} to "%{_wcx}%_%{_wcz}%"
+                        if {_wseen::%{_wkey}%} is not set:
+                            set {_wseen::%{_wkey}%} to true
+                            if eventPolyContains2D({_wcx} + 0.5, {_wcz} + 0.5) is false:
+                                loop integers from {_outerMinY} to {_outerMaxY}:
+                                    set {_yy} to loop-value
+                                    eventBoundaryTryRender({_p}, {_wcx}, {_yy}, {_wcz}, {_c}, {_r2}, {_vr})
+                    add 1 to {_wk}
+        add 1 to {_wi}
+    # Sol/plafond (cellules interieures cachees) en mode useY ON uniquement.
+    if {_useY} is true:
+        if {event::cache::poly::insideSkipped} is true:
+            # Fallback local: scan seulement autour du joueur (borne au rayon de rendu).
+            set {_xFrom} to floor({_px} - {_r})
+            set {_xTo} to floor({_px} + {_r})
+            if {_xFrom} < {_polyMinX} - 1:
+                set {_xFrom} to {_polyMinX} - 1
+            if {_xTo} > {_polyMaxX} + 1:
+                set {_xTo} to {_polyMaxX} + 1
+            set {_zFrom} to floor({_pz} - {_r})
+            set {_zTo} to floor({_pz} + {_r})
+            if {_zFrom} < {_polyMinZ} - 1:
+                set {_zFrom} to {_polyMinZ} - 1
+            if {_zTo} > {_polyMaxZ} + 1:
+                set {_zTo} to {_polyMaxZ} + 1
+            loop integers from {_xFrom} to {_xTo}:
+                set {_xx} to loop-value
+                loop integers from {_zFrom} to {_zTo}:
+                    set {_zz} to loop-value-2
+                    set {_ddx} to {_xx} + 0.5 - {_px}
+                    set {_ddz} to {_zz} + 0.5 - {_pz}
+                    set {_flatD2} to {_ddx} * {_ddx} + {_ddz} * {_ddz}
+                    if {_flatD2} <= {_r2}:
+                        if eventPolyContains2D({_xx} + 0.5, {_zz} + 0.5) is true:
+                            eventBoundaryTryRender({_p}, {_xx}, {_outerMinY}, {_zz}, {_c}, {_r2}, {_vr})
+                            eventBoundaryTryRender({_p}, {_xx}, {_outerMaxY}, {_zz}, {_c}, {_r2}, {_vr})
+        else:
+            set {_icount} to {event::cache::poly::icount}
+            if {_icount} is not set:
+                set {_icount} to 0
+            if {_icount} > 0:
+                set {_ipacked} to {event::cache::poly::ipacked}
+                if {_ipacked} is set:
+                    set {_interiorEntries::*} to {_ipacked} split by ";"
+                    loop {_interiorEntries::*}:
+                        set {_parts::*} to loop-value split by " "
+                        set {_xx} to first element of {_parts::*} parsed as integer
+                        set {_zz} to last element of {_parts::*} parsed as integer
+                        if {_xx} is set:
+                            if {_zz} is set:
+                                set {_ddx} to {_xx} + 0.5 - {_px}
+                                set {_ddz} to {_zz} + 0.5 - {_pz}
+                                set {_flatD2} to {_ddx} * {_ddx} + {_ddz} * {_ddz}
+                                if {_flatD2} <= {_r2}:
+                                    eventBoundaryTryRender({_p}, {_xx}, {_outerMinY}, {_zz}, {_c}, {_r2}, {_vr})
+                                    eventBoundaryTryRender({_p}, {_xx}, {_outerMaxY}, {_zz}, {_c}, {_r2}, {_vr})
+
+    # Mettre en evidence uniquement les angles (sommets) du polygone en rouge.
+    set {_i} to 1
+    while {_i} <= {_n}:
+        set {_vx} to floor(x-coordinate of {event::region::poly::%{_i}%})
+        set {_vy} to floor(y-coordinate of {event::region::poly::%{_i}%})
+        set {_vz} to floor(z-coordinate of {event::region::poly::%{_i}%})
+        eventRenderPolyCornerColumn({_p}, {_vx}, {_vy}, {_vz}, {_outerMinY}, {_outerMaxY}, {_c}, {_r2}, {_vr})
+        add 1 to {_i}
+
+    eventTargetPointParticleFor({_p}, {_c}, {_r})
+
+# Point d'entree du rendu de frontiere (rectangulaire ou polygone) pour un joueur.
+function eventShowBoundaryFxFor(p: player):
+    if eventIsWand(tool of {_p}) is false:
+        stop
+    if {_p} has permission "{@perm}":
+        if gamemode of {_p} is creative:
+            if eventHasRegion() is false:
+                stop
+            if eventSelectionMode() is "poly":
+                if world of {_p} is not world of {event::region::poly::1}:
+                    stop
+                if eventBoundaryCanRenderNow({_p}) is false:
+                    stop
+                eventShowBoundaryFxPolyFor({_p})
+                stop
+            if world of {_p} is not world of {event::region::1}:
+                stop
+            if eventBoundaryCanRenderNow({_p}) is false:
+                stop
+            eventBoundaryInitFaceFrame({_p})
+
+            # Rendu leger: seulement proche d'une limite, en mini-colonnes de particules
+            set {_x1} to x-coordinate of {event::region::1}
+            set {_x2} to x-coordinate of {event::region::2}
+            set {_y1} to y-coordinate of {event::region::1}
+            set {_y2} to y-coordinate of {event::region::2}
+            set {_z1} to z-coordinate of {event::region::1}
+            set {_z2} to z-coordinate of {event::region::2}
+            set {_minX} to floor(min({_x1}, {_x2}))
+            set {_maxX} to floor(max({_x1}, {_x2}))
+            set {_minZ} to floor(min({_z1}, {_z2}))
+            set {_maxZ} to floor(max({_z1}, {_z2}))
+
+            set {_px} to x-coordinate of {_p}
+            set {_py} to y-coordinate of {_p}
+            set {_pz} to z-coordinate of {_p}
+            set {_r} to eventBoundaryRenderRadius()
+            set {_r2} to {_r} * {_r}
+            set {_h} to eventBoundaryWallHeight()
+            set {_c} to location of {_p}
+
+            # Calcul des bornes verticales AVANT toute optimisation,
+            # sinon nearY/minY/maxY sont indefinis quand on les compare.
+            set {_below} to eventBoundaryBelowBlocksLocal()
+            set {_above} to eventBoundaryAboveBlocksLocal()
+
+            if eventUseY() is true:
+                set {_minY} to floor(min({_y1}, {_y2}))
+                set {_maxY} to floor(max({_y1}, {_y2})) + 1
+                # Mode 3D: useY ON = vraie box calee sur la hauteur de la zone.
+            else:
+                set {_minY} to floor({_py}) - {_below}
+                set {_maxY} to floor({_py}) + {_above}
+
+            # Optimisation: si le joueur est loin de toutes les limites, on skip le rendu.
+            # useY ON: on prend aussi en compte la proximite sol/plafond.
+            set {_dxMin} to abs({_px} - {_minX})
+            set {_dxMax} to abs({_px} - {_maxX})
+            set {_dzMin} to abs({_pz} - {_minZ})
+            set {_dzMax} to abs({_pz} - {_maxZ})
+            set {_nearX} to min({_dxMin}, {_dxMax})
+            set {_nearZ} to min({_dzMin}, {_dzMax})
+            set {_skip} to false
+            if eventUseY() is true:
+                set {_dyMin} to abs({_py} - {_minY})
+                set {_dyMax} to abs({_py} - {_maxY})
+                set {_nearY} to min({_dyMin}, {_dyMax})
+                set {_vr} to eventBoundaryVerticalRadius()
+                if {_nearX} > {_r} + 1:
+                    if {_nearZ} > {_r} + 1:
+                        if {_nearY} > {_vr} + 1:
+                            set {_skip} to true
+            else:
+                set {_nearY} to -1
+                set {_vr} to -1
+                if {_nearX} > {_r} + 1:
+                    if {_nearZ} > {_r} + 1:
+                        set {_skip} to true
+
+            # Debug console (cible sur Shamallow_ uniquement) - desactive
+            #if name of {_p} is "Shamallow_":
+            #    send "[event-fx] p=%round({_px})%,%round({_py})%,%round({_pz})% region X[%{_minX}%..%{_maxX}%] Y[%{_minY}%..%{_maxY}%] Z[%{_minZ}%..%{_maxZ}%] r=%{_r}% vr=%{_vr}% nearX=%round({_nearX})% nearZ=%round({_nearZ})% nearY=%round({_nearY})% useY=%eventUseY()% skip=%{_skip}%" to console
+
+            if {_skip} is true:
+                stop
+
+            # Contour externe: on dessine hors zone, pas sur les blocs inclus dans la zone.
+            set {_outerMinX} to {_minX} - 1
+            set {_outerMaxX} to {_maxX} + 1
+            set {_outerMinY} to {_minY} - 1
+            set {_outerMaxY} to {_maxY} + 1
+            set {_outerMinZ} to {_minZ} - 1
+            set {_outerMaxZ} to {_maxZ} + 1
+
+            set {_zFrom} to floor({_pz} - {_r})
+            set {_zTo} to floor({_pz} + {_r})
+            if {_zFrom} < {_outerMinZ}:
+                set {_zFrom} to {_outerMinZ}
+            if {_zTo} > {_outerMaxZ}:
+                set {_zTo} to {_outerMaxZ}
+
+            set {_xFrom} to floor({_px} - {_r})
+            set {_xTo} to floor({_px} + {_r})
+            if {_xFrom} < {_outerMinX}:
+                set {_xFrom} to {_outerMinX}
+            if {_xTo} > {_outerMaxX}:
+                set {_xTo} to {_outerMaxX}
+
+            # Faces X = min/max externes, filtre autour du joueur
+            loop integers from {_zFrom} to {_zTo}:
+                set {_zz} to loop-value
+                loop integers from {_outerMinY} to {_outerMaxY}:
+                    set {_yy} to loop-value-2
+                    eventBoundaryTryRender({_p}, {_outerMinX}, {_yy}, {_zz}, {_c}, {_r2}, {_vr})
+                    if {_outerMaxX} is not {_outerMinX}:
+                        eventBoundaryTryRender({_p}, {_outerMaxX}, {_yy}, {_zz}, {_c}, {_r2}, {_vr})
+
+            # Faces Z = min/max externes, filtre autour du joueur
+            loop integers from {_xFrom} to {_xTo}:
+                set {_xx} to loop-value
+                loop integers from {_outerMinY} to {_outerMaxY}:
+                    set {_yy} to loop-value-2
+                    eventBoundaryTryRender({_p}, {_xx}, {_yy}, {_outerMinZ}, {_c}, {_r2}, {_vr})
+                    if {_outerMaxZ} is not {_outerMinZ}:
+                        eventBoundaryTryRender({_p}, {_xx}, {_yy}, {_outerMaxZ}, {_c}, {_r2}, {_vr})
+
+            # useY ON: ajouter aussi plafond/sol externes pour une box 3D complete.
+            if eventUseY() is true:
+                loop integers from {_xFrom} to {_xTo}:
+                    set {_xx} to loop-value
+                    loop integers from {_zFrom} to {_zTo}:
+                        set {_zz} to loop-value-2
+                        eventBoundaryTryRender({_p}, {_xx}, {_outerMinY}, {_zz}, {_c}, {_r2}, {_vr})
+                        if {_outerMaxY} is not {_outerMinY}:
+                            eventBoundaryTryRender({_p}, {_xx}, {_outerMaxY}, {_zz}, {_c}, {_r2}, {_vr})
+
+            # Aretes verticales des 4 coins du rectangle en rouge (equivalent sommets polygone).
+            loop integers from {_outerMinY} to {_outerMaxY}:
+                set {_yy} to loop-value
+                eventBoundaryTryRenderCorner({_p}, {_minX}, {_yy}, {_minZ}, {_c}, {_r2}, {_vr})
+                eventBoundaryTryRenderCorner({_p}, {_maxX}, {_yy}, {_minZ}, {_c}, {_r2}, {_vr})
+                eventBoundaryTryRenderCorner({_p}, {_minX}, {_yy}, {_maxZ}, {_c}, {_r2}, {_vr})
+                eventBoundaryTryRenderCorner({_p}, {_maxX}, {_yy}, {_maxZ}, {_c}, {_r2}, {_vr})
+
+            eventTargetPointParticleFor({_p}, {_c}, {_r})
+
+# Boucle unique de rafraîchissement
+every {@ab_period}:
+    loop all players:
+        if eventIsActive() is true:
+            if {event::joined::%uuid of loop-player%} is set:
+                eventActionBarFor(loop-player)
+            else:
+                eventBuildAssistBar(loop-player)
+        else:
+            eventBuildAssistBar(loop-player)
+        eventShowBoundaryFxFor(loop-player)
+
+# ============================================================
+#  Interactions dans la zone (configurable)
+# ============================================================
+
+function eventIsContainerType(t: item type) :: boolean:
+    if {_t} is chest or trapped chest or barrel:
+        return true
+    if {_t} is hopper or dispenser or dropper:
+        return true
+    if {_t} is furnace or blast furnace or smoker:
+        return true
+    if {_t} is brewing stand or shulker box:
+        return true
+    return false
+
+function eventIsSwitchType(t: item type) :: boolean:
+    if {_t} is lever:
+        return true
+    if {_t} is stone button or oak button or spruce button or birch button or jungle button or acacia button or dark oak button or mangrove button or cherry button or bamboo button or crimson button or warped button or polished blackstone button:
+        return true
+    return false
+
+function eventIsDoorType(t: item type) :: boolean:
+    if {_t} is oak door or spruce door or birch door or jungle door or acacia door or dark oak door or mangrove door or cherry door or bamboo door or crimson door or warped door or iron door:
+        return true
+    if {_t} is oak trapdoor or spruce trapdoor or birch trapdoor or jungle trapdoor or acacia trapdoor or dark oak trapdoor or mangrove trapdoor or cherry trapdoor or bamboo trapdoor or crimson trapdoor or warped trapdoor or iron trapdoor:
+        return true
+    if {_t} is oak fence gate or spruce fence gate or birch fence gate or jungle fence gate or acacia fence gate or dark oak fence gate or mangrove fence gate or cherry fence gate or bamboo fence gate or crimson fence gate or warped fence gate:
+        return true
+    return false
+
+on right click:
+    eventIsActive() is true
+    if player has permission "{@perm}":
+        stop
+    set {_b} to event-block
+    {_b} is set
+    eventInRegion(location of {_b}) is true
+    set {_t} to type of {_b}
+    if eventCanOpenContainers() is false:
+        if eventIsContainerType({_t}) is true:
+            cancel event
+            send action bar "&cOuverture des conteneurs desactivee dans la zone event." to player
+            stop
+    if eventCanUseSwitches() is false:
+        if eventIsSwitchType({_t}) is true:
+            cancel event
+            send action bar "&cBoutons/leviers desactives dans la zone event." to player
+            stop
+    if eventCanUseDoors() is false:
+        if eventIsDoorType({_t}) is true:
+            cancel event
+            send action bar "&cPortes/trappes/portillons desactives dans la zone event." to player
+            stop
+
+# ============================================================
+#  Wand clicks
+# ============================================================
+
+on left click:
+    eventIsWand(tool of player) is true
+    player has permission "{@perm}"
+    cancel event
+    set {_b} to event-block
+    if {_b} is not set:
+        if player is sneaking:
+            if eventSelectionMode() is "poly":
+                eventPolyClear()
+                eventEnsureTargetPointInRegion(player)
+                play sound "minecraft:block.note_block.bass" with volume 0.7 with pitch 0.8 to player
+                send action bar "&c&lPolygone vide" to player
+        stop
+    if eventSelectionMode() is "poly":
+        set {_poly_added} to eventPolyAdd(location of {_b})
+        eventEnsureTargetPointInRegion(player)
+        play sound "minecraft:block.note_block.pling" with volume 0.6 with pitch 1.5 to player
+        if {_poly_added} is true:
+            send action bar "&a&lPoint #%eventPolyCount()% ajoute &8(&f%x-coordinate of {_b}%&8, &f%y-coordinate of {_b}%&8, &f%z-coordinate of {_b}%&8)" to player
+        else:
+            send action bar "&e&lSommet #%eventPolyCount()% recadre &7(colineaire) &8(&f%x-coordinate of {_b}%&8, &f%y-coordinate of {_b}%&8, &f%z-coordinate of {_b}%&8)" to player
+        stop
+    set {event::region::1} to location of {_b}
+    eventEnsureTargetPointInRegion(player)
+    play sound "minecraft:block.note_block.pling" with volume 0.6 with pitch 1.6 to player
+    send action bar "&a&lPos1 &7sélectionnée &8(&f%x-coordinate of {_b}%&8, &f%y-coordinate of {_b}%&8, &f%z-coordinate of {_b}%&8)" to player
+
+on right click:
+    eventIsWand(tool of player) is true
+    player has permission "{@perm}"
+    cancel event
+    set {_b} to event-block
+    if {_b} is not set:
+        if player is sneaking:
+            if eventSelectionMode() is "poly":
+                delete {event::region::mode}
+                send "{@prefix}&aMode selection: &erectangulaire &7(2 coins)" to player
+            else:
+                set {event::region::mode} to "poly"
+                send "{@prefix}&aMode selection: &epolygone" to player
+                send "{@prefix}&7Clic gauche bloc = ajouter sommet &8| &7Clic droit bloc = retirer dernier &8| &7Sneak + clic gauche air = vider" to player
+            play sound "minecraft:block.note_block.pling" with volume 0.6 with pitch 1.0 to player
+        stop
+    if eventSelectionMode() is "poly":
+        if eventPolyRemoveLast() is true:
+            eventEnsureTargetPointInRegion(player)
+            play sound "minecraft:block.note_block.bass" with volume 0.5 with pitch 1.2 to player
+            send action bar "&e&lPoint retire &7(reste &f%eventPolyCount()%&7)" to player
+        else:
+            send action bar "&cAucun point a retirer." to player
+        stop
+    set {event::region::2} to location of {_b}
+    eventEnsureTargetPointInRegion(player)
+    play sound "minecraft:block.note_block.pling" with volume 0.6 with pitch 1.8 to player
+    send action bar "&b&lPos2 &7sélectionnée &8(&f%x-coordinate of {_b}%&8, &f%y-coordinate of {_b}%&8, &f%z-coordinate of {_b}%&8)" to player
+
+# ============================================================
+#  Sneak join (5 sneaks rapides)
+# ============================================================
+
+function eventJoinPlayer(p: player):
+    set {event::joined::%uuid of {_p}%} to true
+    delete {event::arrived::%uuid of {_p}%}
+    delete {event::arrival::near::%uuid of {_p}%}
+    delete {event::arrival::step::%uuid of {_p}%}
+    delete metadata value "event_arrival_near" of {_p}
+    delete metadata value "event_arrival_step" of {_p}
+    delete metadata value "event_inside_zone" of {_p}
+    delete metadata value "event_boundary_last" of {_p}
+    delete {event::sneakCount::%uuid of {_p}%}
+    delete {event::lastSneak::%uuid of {_p}%}
+    play sound "minecraft:entity.player.levelup" with volume 0.8 with pitch 1.2 to {_p}
+    play sound "minecraft:block.beacon.power_select" with volume 0.6 with pitch 1.6 to {_p}
+    send title "&6&l✦ EVENT ✦" with subtitle "&eVous avez rejoint l'event !" to {_p} for 5 ticks, 40 ticks and 10 ticks
+    send "{@prefix}&aVous avez rejoint l'event. Suivez la flèche !" to {_p}
+
+on toggle sneak:
+    player is sneaking
+    eventIsActive() is true
+    set {_uuid} to uuid of player
+    if {event::joined::%{_uuid}%} is set:
+        stop
+    # fenêtre temporelle
+    if {event::lastSneak::%{_uuid}%} is set:
+        set {_diff} to difference between {event::lastSneak::%{_uuid}%} and now
+        if {_diff} is greater than {@sneak_window} milliseconds:
+            set {event::sneakCount::%{_uuid}%} to 0
+    set {event::lastSneak::%{_uuid}%} to now
+    add 1 to {event::sneakCount::%{_uuid}%}
+    set {_n} to {event::sneakCount::%{_uuid}%}
+    if {_n} >= {@sneak_needed}:
+        eventJoinPlayer(player)
+        stop
+    # ne pas spammer les joueurs qui sneakent par hasard:
+    # afficher le feedback uniquement à partir de 25% (>= 2 sur 5)
+    set {_threshold} to ceil({@sneak_needed} * 0.25)
+    if {_n} < {_threshold}:
+        stop
+    play sound "minecraft:block.note_block.hat" with volume 0.4 with pitch (0.8 + {_n} * 0.1) to player
+    send action bar "&e&lRejoindre l'event &7[&a%{_n}%&7/&a{@sneak_needed}&7]" to player
+
+# Nettoyage périodique des compteurs périmés (libère la mémoire)
+every 10 seconds:
+    loop indices of {event::lastSneak::*}:
+        set {_ts} to {event::lastSneak::%loop-value%}
+        if {_ts} is set:
+            if difference between {_ts} and now is greater than 5 seconds:
+                delete {event::sneakCount::%loop-value%}
+                delete {event::lastSneak::%loop-value%}
+
+# ============================================================
+#  Protection blocs (configurable)
+# ============================================================
+
+on break:
+    eventIsActive() is true
+    eventIsProtect() is true
+    set {_b} to event-block
+    {_b} is set
+    eventInRegion(location of {_b}) is true
+    # exception: le bloc cible reste cassable (chasse au trésor)
+    if eventIsTargetBlock(type of {_b}) is true:
+        stop
+    player has permission "{@perm}":
+        stop
+    cancel event
+    send action bar "&cBlocs verrouillés pendant l'event." to player
+
+# ============================================================
+#  PvP dans la zone (configurable)
+# ============================================================
+
+on damage:
+    eventIsActive() is true
+    victim is a player
+    attacker is a player
+    eventInRegion(location of victim) is true
+    if eventIsPvp() is true:
+        stop
+    cancel event
+    send action bar "&cPvP désactivé dans la zone d'event." to attacker
+
+on damage of player:
+    eventIsActive() is true
+    eventInRegion(location of victim) is true
+    if attacker is a player:
+        stop
+    if eventIsPve() is true:
+        stop
+    cancel event
+
+# ============================================================
+#  Chasse aux trésors: cassage de pots décoratifs
+# ============================================================
+
+function eventTreasureFound(p: player):
+    add 1 to {event::treasures}
+    set {_n} to {event::treasures}
+    set {_total} to {event::total}
+    if {_total} is not set:
+        set {_total} to {_n}
+    set {_name} to name of {_p}
+    loop all players:
+        if {event::joined::%uuid of loop-player%} is set:
+            send "&8[&6EVENT&8] &6✦ &e%{_name}% &fa trouvé un &6trésor &7(&e%{_n}%&7/&e%{_total}%&7) &6✦" to loop-player
+            play sound "minecraft:entity.player.levelup" with volume 0.5 with pitch 1.4 to loop-player
+    # effets sur le finder
+    play sound "minecraft:block.amethyst_block.chime" with volume 1 with pitch 1.2 to {_p}
+    play sound "minecraft:entity.experience_orb.pickup" with volume 1 with pitch 1.6 to {_p}
+    send "{@prefix}&aTu as trouvé et cassé une tête trésor ! &7(&e%{_n}%&7/&e%{_total}%&7)" to {_p}
+    send action bar "&6+1 trésor &7(&e%{_n}%&7/&e%{_total}%&7)" to {_p}
+    send title "&6&l✦ TRÉSOR ✦" with subtitle "&e%{_n}%&7/&e%{_total}% &ftrouvé(s)" to {_p} for 5 ticks, 30 ticks and 10 ticks
+    # tous les trésors trouvés: annonce finale
+    if {_n} >= {_total}:
+        broadcast "&8&m---------------------------------------------"
+        broadcast "&6&l        ✦ TOUS LES TRÉSORS TROUVÉS ! ✦"
+        broadcast "&fDernier trésor: &e%{_name}%"
+        broadcast "&8&m---------------------------------------------"
+        loop all players:
+            play sound "minecraft:ui.toast.challenge_complete" with volume 0.8 with pitch 1 to loop-player
+
+on break:
+    eventIsActive() is true
+    set {_b} to event-block
+    {_b} is set
+    eventInRegion(location of {_b}) is true
+    eventIsTargetBlock(type of {_b}) is true
+    # seuls les participants comptent
+    if {event::joined::%uuid of player%} is not set:
+        cancel event
+        send action bar "&cTu dois d'abord rejoindre l'event avant de casser une tête trésor." to player
+        stop
+    if {event::arrived::%uuid of player%} is not true:
+        cancel event
+        send action bar "&cValide d'abord ton arrivee avant de casser un tresor." to player
+        stop
+    eventTreasureFound(player)
+
+# ============================================================
+#  Quit / nettoyage joueur
+# ============================================================
+
+on quit:
+    set {_uuid} to uuid of player
+    delete {event::sneakCount::%{_uuid}%}
+    delete {event::lastSneak::%{_uuid}%}
+    delete {event::inside::%{_uuid}%}
+    delete {event::arrived::%{_uuid}%}
+    delete {event::arrival::near::%{_uuid}%}
+    delete {event::arrival::step::%{_uuid}%}
+    delete {event::boundaryfx::last::%{_uuid}%}
+    delete metadata value "event_inside_zone" of player
+    delete metadata value "event_arrival_near" of player
+    delete metadata value "event_arrival_step" of player
+    delete metadata value "event_boundary_last" of player
+    # on garde {event::joined::*} pour qu'ils restent participants à la reconnexion
+
+# ============================================================
+#  Commandes admin
+# ============================================================
+
+function eventCmdHelp(s: player):
+    send "{@prefix}&7&m-----------------------------------------" to {_s}
+    send "{@prefix}&6/event menu &8» &7ouvre le menu de configuration" to {_s}
+    send "{@prefix}&6/eventsetup &8» &7raccourci menu de configuration" to {_s}
+    send "{@prefix}&6/event wand &8» &7récupère la hache de sélection" to {_s}
+    send "{@prefix}&6/event start &8» &7ouvre l'event" to {_s}
+    send "{@prefix}&6/event stop &8» &7termine l'event" to {_s}
+    send "{@prefix}&6/event status &8» &7état actuel" to {_s}
+    send "{@prefix}&6/event list &8» &7liste des participants" to {_s}
+    send "{@prefix}&6/event protect <on|off> &8» &7verrouille les blocs" to {_s}
+    send "{@prefix}&6/event pvp <on|off> &8» &7autorise le PvP dans la zone" to {_s}
+    send "{@prefix}&6/event pve <on|off> &8» &7autorise les dégâts mobs/environnement dans la zone" to {_s}
+    send "{@prefix}&6/event arrivalradius <metres> &8» &7distance max pour valider l'arrivee" to {_s}
+    send "{@prefix}&6/event arrivalblock <on|off> &8» &7impose de marcher sur un bloc defini" to {_s}
+    send "{@prefix}&6/event arrivaltype [<type>] &8» &7bloc de passage (vide = item en main)" to {_s}
+
+
+    send "{@prefix}&6/event usey <on|off> &8» &7prend en compte la hauteur Y dans la zone" to {_s}
+    send "{@prefix}&6/event containers <on|off> &8» &7autorise l'ouverture des coffres/conteneurs" to {_s}
+    send "{@prefix}&6/event switches <on|off> &8» &7autorise boutons et leviers" to {_s}
+    send "{@prefix}&6/event doors <on|off> &8» &7autorise portes, trappes et portillons" to {_s}
+    send "{@prefix}&6/event point <set|clear> &8» &7point de visée de la flèche (hors zone)" to {_s}
+    send "{@prefix}&6/event say <message> &8» &7annonce aux participants" to {_s}
+    send "{@prefix}&6/event broadcast <message> &8» &7annonce au serveur" to {_s}
+    send "{@prefix}&6/event kick <joueur> &8» &7retire un joueur de l'event" to {_s}
+    send "{@prefix}&6/event reset &8» &7réinitialise tout" to {_s}
+    send "{@prefix}&6/event setblock [<type>] &8» &7définit le bloc cible (vide = item en main)" to {_s}
+    send "{@prefix}&6/event scan &8» &7compte les blocs cibles dans la zone" to {_s}
+    send "{@prefix}&7&m-----------------------------------------" to {_s}
+
+function eventSetBlockFromHand(p: player):
+    set {_t} to eventPreferredBlockType({_p})
+    if {_t} is air:
+        send "{@prefix}&cVise un bloc, ou tiens le bloc cible en main, ou utilise &6/event setblock <type>&c." to {_p}
+        stop
+    set {event::block} to {_t}
+    send "{@prefix}&aBloc cible défini sur &6%{_t}%&a." to {_p}
+    if eventIsActive() is true:
+        if eventHasRegion() is true:
+            set {event::total} to eventScanZone()
+            send "{@prefix}&7Re-scan: &f%{event::total}% &7blocs trouvés dans la zone." to {_p}
+
+function eventSetBlockFromArg(p: player, raw: text):
+    set {_t} to {_raw} parsed as item type
+    if {_t} is not set:
+        send "{@prefix}&cType inconnu: &f%{_raw}%&c." to {_p}
+        stop
+    set {event::block} to {_t}
+    send "{@prefix}&aBloc cible défini sur &6%{_t}%&a." to {_p}
+    if eventIsActive() is true:
+        if eventHasRegion() is true:
+            set {event::total} to eventScanZone()
+            send "{@prefix}&7Re-scan: &f%{event::total}% &7blocs trouvés dans la zone." to {_p}
+
+function eventScanCmd(p: player):
+    if eventHasRegion() is false:
+        send "{@prefix}&cDéfinis d'abord la zone." to {_p}
+        stop
+    set {_n} to eventScanZone()
+    if eventIsActive() is true:
+        set {event::total} to {_n}
+    send "{@prefix}&7Cible: &6%eventTargetName()% &8| &f%{_n}% &7bloc(s) dans la zone." to {_p}
+
+function eventSetPoint(s: player):
+    if eventHasRegion() is false:
+        send "{@prefix}&cDefinis d'abord la zone avec la wand." to {_s}
+        stop
+    if eventInRegion(location of {_s}) is false:
+        send "{@prefix}&cPlace-toi dans la zone pour definir le point de visee." to {_s}
+        stop
+    set {event::target::loc} to location of {_s}
+    send "{@prefix}&aPoint de visee defini a &f%round(x-coordinate of {_s})%, %round(y-coordinate of {_s})%, %round(z-coordinate of {_s})%&a." to {_s}
+
+function eventClearPoint(s: player):
+    delete {event::target::loc}
+    send "{@prefix}&7Point de visee retire. Retour au centre de la zone." to {_s}
+
+function eventStart(s: player):
+    if eventHasRegion() is false:
+        send "{@prefix}&cDéfinis d'abord la zone avec la &6Zone Wand&c." to {_s}
+        stop
+    if eventIsActive() is true:
+        send "{@prefix}&cL'event est déjà en cours." to {_s}
+        stop
+    set {event::active} to true
+    delete {event::joined::*}
+    delete {event::arrived::*}
+    delete {event::arrival::near::*}
+    delete {event::arrival::step::*}
+    delete {event::sneakCount::*}
+    delete {event::lastSneak::*}
+    delete {event::inside::*}
+    delete {event::treasures}
+    # Scan auto de la zone pour compter les blocs cibles
+    set {event::total} to eventScanZone()
+    set {_targetName} to eventTargetName()
+    if {event::total} <= 0:
+        send "{@prefix}&cAucun &6%{_targetName}% &ctrouvé dans la zone ! Place-en avant de démarrer." to {_s}
+        delete {event::active}
+        delete {event::total}
+        stop
+    send "{@prefix}&aEvent démarré. &7Cible: &6%{_targetName}% &8(&f%{event::total}%&8 à trouver). Les joueurs peuvent rejoindre en sneakant rapidement." to {_s}
+    broadcast "&8&m---------------------------------------------"
+    broadcast "&6&l        ✦ UN EVENT VIENT DE DÉMARRER ✦"
+    broadcast "&fPour rejoindre, &eaccroupissez-vous plusieurs fois rapidement &fn'importe où !"
+    broadcast "&8&m---------------------------------------------"
+    loop all players:
+        play sound "minecraft:block.beacon.activate" with volume 0.4 with pitch 1.0 to loop-player
+
+function eventStop(s: player):
+    if eventIsActive() is false:
+        send "{@prefix}&cAucun event en cours." to {_s}
+        stop
+    set {_count} to size of {event::joined::*}
+    eventClearAllState()
+    send "{@prefix}&aEvent terminé. &7%{_count}% participants nettoyés." to {_s}
+    broadcast "{@prefix}&7L'event est terminé. Merci aux participants !"
+
+function eventList(s: player):
+    if eventIsActive() is false:
+        send "{@prefix}&cAucun event en cours." to {_s}
+        stop
+    set {_count} to size of {event::joined::*}
+    if {_count} is 0:
+        send "{@prefix}&7Aucun participant pour l'instant." to {_s}
+        stop
+    delete {_online::*}
+    delete {_offline::*}
+    loop indices of {event::joined::*}:
+        set {_p} to loop-value parsed as offline player
+        if {_p} is set:
+            if {_p} is online:
+                add name of {_p} to {_online::*}
+            else:
+                add name of {_p} to {_offline::*}
+        else:
+            add "&8?%loop-value%" to {_offline::*}
+    set {_tr} to {event::treasures}
+    if {_tr} is not set:
+        set {_tr} to 0
+    set {_tot} to {event::total}
+    if {_tot} is not set:
+        set {_tot} to 0
+    set {_arr} to size of {event::arrived::*}
+    send "{@prefix}&7&m-----------------------------------------" to {_s}
+    send "{@prefix}&6Participants &7(&f%{_count}%&7) &8· &aarrives &f%{_arr}% &8· &etrésors &f%{_tr}%&7/&f%{_tot}% &8· &6%eventTargetName()%" to {_s}
+    if size of {_online::*} > 0:
+        send "{@prefix}&aEn ligne &8(&f%size of {_online::*}%&8)&7: &f%{_online::*}%" to {_s}
+    if size of {_offline::*} > 0:
+        send "{@prefix}&cHors-ligne &8(&f%size of {_offline::*}%&8)&7: &f%{_offline::*}%" to {_s}
+    send "{@prefix}&7&m-----------------------------------------" to {_s}
+
+function eventStatus(s: player):
+    if eventIsActive() is true:
+        send "{@prefix}&aActif &7- participants: &f%size of {event::joined::*}%" to {_s}
+    else:
+        send "{@prefix}&cInactif" to {_s}
+    if eventSelectionMode() is "poly":
+        send "{@prefix}&7Mode selection: &epolygone &8(&f%eventPolyCount()% &7sommet(s)&8)" to {_s}
+    else:
+        send "{@prefix}&7Mode selection: &erectangulaire" to {_s}
+    if eventHasRegion() is true:
+        set {_c} to eventRegionCenter()
+        send "{@prefix}&7Zone: &f%world of {_c}% &8| centre &f%round(x-coordinate of {_c})%, %round(y-coordinate of {_c})%, %round(z-coordinate of {_c})%" to {_s}
+        if {event::target::loc} is set:
+            set {_pt} to {event::target::loc}
+            send "{@prefix}&7Point de visee: &f%round(x-coordinate of {_pt})%, %round(y-coordinate of {_pt})%, %round(z-coordinate of {_pt})% &8(&apersonnalise&8)" to {_s}
+        else:
+            send "{@prefix}&7Point de visee: &fcentre de zone &8(&7par defaut&8)" to {_s}
+    else:
+        send "{@prefix}&7Zone: &cnon définie" to {_s}
+    set {_canBreak} to true
+    if eventIsProtect() is true:
+        set {_canBreak} to false
+    send "{@prefix}&7Peut casser des blocs: %eventYesNo({_canBreak})%" to {_s}
+    send "{@prefix}&7PvP autorise: %eventYesNo(eventIsPvp())%" to {_s}
+    send "{@prefix}&7Degats PvE autorises: %eventYesNo(eventIsPve())%" to {_s}
+    send "{@prefix}&7Distance max d'arrivee: &f%eventArrivalRadius()%m" to {_s}
+    send "{@prefix}&7Bloc de passage requis: %eventYesNo(eventArrivalNeedStep())%" to {_s}
+    send "{@prefix}&7Type bloc de passage: &6%eventArrivalBlockName()%" to {_s}
+    send "{@prefix}&7Barre setup creative: &eautomatique si hache en main" to {_s}
+    send "{@prefix}&7Mur de particules: &eautomatique si hache en main" to {_s}
+    send "{@prefix}&7Hauteur Y prise en compte: %eventYesNo(eventUseY())%" to {_s}
+    send "{@prefix}&7Ouverture des conteneurs autorisee: %eventYesNo(eventCanOpenContainers())%" to {_s}
+    send "{@prefix}&7Boutons/leviers autorises: %eventYesNo(eventCanUseSwitches())%" to {_s}
+    send "{@prefix}&7Portes/trappes/portillons autorises: %eventYesNo(eventCanUseDoors())%" to {_s}
+    set {_target} to eventTargetName()
+    if eventIsActive() is true:
+        set {_f} to {event::treasures} ? 0
+        set {_t} to {event::total} ? 0
+        send "{@prefix}&7Cible: &6%{_target}% &8| trésors &f%{_f}%&7/&f%{_t}%" to {_s}
+    else:
+        send "{@prefix}&7Cible: &6%{_target}%" to {_s}
+
+function eventSetProtect(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::protect} to true
+        send "{@prefix}&aProtection blocs activée." to {_s}
+        stop
+    if {_mode} is "off":
+        delete {event::protect}
+        send "{@prefix}&cProtection blocs désactivée." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event protect <on|off>" to {_s}
+
+function eventSetPvp(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::pvp} to true
+        send "{@prefix}&aPvP activé pour la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        delete {event::pvp}
+        send "{@prefix}&cPvP désactivé pour la zone." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event pvp <on|off>" to {_s}
+
+function eventSetPve(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::pve} to true
+        send "{@prefix}&aPvE activé pour la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        delete {event::pve}
+        send "{@prefix}&cPvE désactivé pour la zone." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event pve <on|off>" to {_s}
+
+function eventSetArrivalRadius(s: player, raw: text):
+    set {_n} to {_raw} parsed as number
+    if {_n} is not set:
+        send "{@prefix}&cNombre invalide: &f%{_raw}%&c." to {_s}
+        stop
+    if {_n} < 1:
+        send "{@prefix}&cLa distance doit etre >= 1." to {_s}
+        stop
+    set {event::arrival::radius} to {_n}
+    send "{@prefix}&aDistance d'arrivee definie a &f%{_n}%m&a." to {_s}
+
+function eventSetArrivalBlockToggle(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::arrival::needstep} to true
+        send "{@prefix}&aBloc de passage requis pour valider l'arrivee." to {_s}
+        stop
+    if {_mode} is "off":
+        delete {event::arrival::needstep}
+        send "{@prefix}&cBloc de passage non requis pour valider l'arrivee." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event arrivalblock <on|off>" to {_s}
+
+function eventSetArrivalBlockFromHand(s: player):
+    set {_t} to eventPreferredBlockType({_s})
+    if {_t} is air:
+        send "{@prefix}&cVise un bloc d'abord. Sinon tiens-le en main, ou utilise /event arrivaltype <type>." to {_s}
+        stop
+    set {event::arrival::block} to {_t}
+    send "{@prefix}&aBloc de passage defini sur &6%{_t}%&a." to {_s}
+
+function eventCycleArrivalRadius(s: player):
+    set {_r} to eventArrivalRadius()
+    if {_r} < 4:
+        set {_next} to 4
+    else if {_r} < 6:
+        set {_next} to 6
+    else if {_r} < 8:
+        set {_next} to 8
+    else if {_r} < 10:
+        set {_next} to 10
+    else if {_r} < 12:
+        set {_next} to 12
+    else if {_r} < 16:
+        set {_next} to 16
+    else if {_r} < 24:
+        set {_next} to 24
+    else:
+        set {_next} to 4
+    set {event::arrival::radius} to {_next}
+    send "{@prefix}&aDistance d'arrivee definie a &f%{_next}%m&a." to {_s}
+
+function eventOpenMenu(p: player):
+    set {_inv} to chest inventory with 4 rows named "&8[&6Event&8] &fConfiguration"
+    set {_canBreak} to true
+    if eventIsProtect() is true:
+        set {_canBreak} to false
+
+    if eventIsActive() is true:
+        set {_activeItem} to lime dye named "&aEvent actif"
+        set lore of {_activeItem} to "&7Clique pour &cstop &7l'event"
+    else:
+        set {_activeItem} to gray dye named "&cEvent inactif"
+        set lore of {_activeItem} to "&7Clique pour &astart &7l'event"
+    set slot 0 of {_inv} to {_activeItem}
+
+    set {_wandItem} to golden axe named "&6Zone Wand"
+    set lore of {_wandItem} to "&7Recuperer l'outil de selection"
+    set slot 1 of {_inv} to {_wandItem}
+
+    set {_pointSet} to compass named "&eDefinir point de visee"
+    set lore of {_pointSet} to "&7Clique en etant dans la zone"
+    set slot 2 of {_inv} to {_pointSet}
+
+    set {_pointClear} to recovery compass named "&7Reset point de visee"
+    set lore of {_pointClear} to "&7Revient au centre de zone"
+    set slot 3 of {_inv} to {_pointClear}
+
+    set {_treasureItem} to player head named "&6Bloc tresor cible"
+    set lore of {_treasureItem} to "&7Clique: bloc vise, sinon main", "&7Actuel: &f%eventTargetName()%"
+    set slot 4 of {_inv} to {_treasureItem}
+
+    set {_scanItem} to spyglass named "&bRescan tresors"
+    set lore of {_scanItem} to "&7Recompte les blocs cibles dans la zone"
+    set slot 5 of {_inv} to {_scanItem}
+
+    set {_protectItem} to iron pickaxe named "&7Peut casser des blocs: %eventYesNo({_canBreak})%"
+    set lore of {_protectItem} to "&7Clique pour basculer"
+    set slot 9 of {_inv} to {_protectItem}
+
+    set {_pvpItem} to iron sword named "&7PvP autorise: %eventYesNo(eventIsPvp())%"
+    set lore of {_pvpItem} to "&7Clique pour basculer"
+    set slot 10 of {_inv} to {_pvpItem}
+
+    set {_pveItem} to shield named "&7Degats PvE autorises: %eventYesNo(eventIsPve())%"
+    set lore of {_pveItem} to "&7Clique pour basculer"
+    set slot 11 of {_inv} to {_pveItem}
+
+    set {_contItem} to chest named "&7Ouverture conteneurs: %eventYesNo(eventCanOpenContainers())%"
+    set lore of {_contItem} to "&7Clique pour basculer"
+    set slot 12 of {_inv} to {_contItem}
+
+    set {_switchItem} to lever named "&7Boutons/leviers autorises: %eventYesNo(eventCanUseSwitches())%"
+    set lore of {_switchItem} to "&7Clique pour basculer"
+    set slot 13 of {_inv} to {_switchItem}
+
+    set {_doorItem} to oak door named "&7Portes/trappes/portillons: %eventYesNo(eventCanUseDoors())%"
+    set lore of {_doorItem} to "&7Clique pour basculer"
+    set slot 14 of {_inv} to {_doorItem}
+
+    set {_arrNeedItem} to heavy weighted pressure plate named "&7Bloc de passage requis: %eventYesNo(eventArrivalNeedStep())%"
+    set lore of {_arrNeedItem} to "&7Clique pour basculer"
+    set slot 18 of {_inv} to {_arrNeedItem}
+
+    set {_arrTypeItem} to gold block named "&7Bloc de passage: &6%eventArrivalBlockName()%"
+    set lore of {_arrTypeItem} to "&7Clique: bloc vise, sinon main"
+    set slot 19 of {_inv} to {_arrTypeItem}
+
+    set {_arrRadius} to ender pearl named "&7Distance d'arrivee: &f%eventArrivalRadius()%m"
+    set lore of {_arrRadius} to "&7Clique pour cycler: 4,6,8,10,12,16,24"
+    set slot 20 of {_inv} to {_arrRadius}
+
+    set slot 21 of {_inv} to gray stained glass pane named " "
+
+    set slot 22 of {_inv} to gray stained glass pane named " "
+
+    set {_useYItem} to scaffolding named "&7Prendre la hauteur Y: %eventYesNo(eventUseY())%"
+    set lore of {_useYItem} to "&7ON: zone 3D", "&7OFF: zone en colonne X/Z"
+    set slot 23 of {_inv} to {_useYItem}
+
+    set {_statusItem} to book named "&fVoir status en chat"
+    set lore of {_statusItem} to "&7Clique pour afficher /event status"
+    set slot 26 of {_inv} to {_statusItem}
+
+    set {_closeItem} to barrier named "&cFermer"
+    set slot 31 of {_inv} to {_closeItem}
+
+    open {_inv} to {_p}
+
+on inventory click:
+    if name of event-inventory is not "&8[&6Event&8] &fConfiguration":
+        stop
+    cancel event
+    if event-slot is not set:
+        stop
+    set {_slot} to index of event-slot
+    if {_slot} is 0:
+        if eventIsActive() is true:
+            eventStop(player)
+        else:
+            eventStart(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 1:
+        eventGiveWand(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 2:
+        eventSetPoint(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 3:
+        eventClearPoint(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 4:
+        eventSetBlockFromHand(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 5:
+        eventScanCmd(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 9:
+        if eventIsProtect() is true:
+            eventSetProtect(player, "off")
+        else:
+            eventSetProtect(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 10:
+        if eventIsPvp() is true:
+            eventSetPvp(player, "off")
+        else:
+            eventSetPvp(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 11:
+        if eventIsPve() is true:
+            eventSetPve(player, "off")
+        else:
+            eventSetPve(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 12:
+        if eventCanOpenContainers() is true:
+            eventSetContainers(player, "off")
+        else:
+            eventSetContainers(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 13:
+        if eventCanUseSwitches() is true:
+            eventSetSwitches(player, "off")
+        else:
+            eventSetSwitches(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 14:
+        if eventCanUseDoors() is true:
+            eventSetDoors(player, "off")
+        else:
+            eventSetDoors(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 18:
+        if eventArrivalNeedStep() is true:
+            eventSetArrivalBlockToggle(player, "off")
+        else:
+            eventSetArrivalBlockToggle(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 19:
+        eventSetArrivalBlockFromHand(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 20:
+        eventCycleArrivalRadius(player)
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 23:
+        if eventUseY() is true:
+            eventSetUseY(player, "off")
+        else:
+            eventSetUseY(player, "on")
+        eventOpenMenu(player)
+        stop
+    if {_slot} is 26:
+        eventStatus(player)
+        stop
+    if {_slot} is 31:
+        close player's inventory
+        stop
+
+command /eventsetup:
+    permission: {@perm}
+    permission message: &cTu n'as pas la permission.
+    trigger:
+        eventOpenMenu(player)
+
+function eventSetArrivalBlockFromArg(s: player, raw: text):
+    set {_t} to {_raw} parsed as item type
+    if {_t} is not set:
+        send "{@prefix}&cType inconnu: &f%{_raw}%&c." to {_s}
+        stop
+    set {event::arrival::block} to {_t}
+    send "{@prefix}&aBloc de passage defini sur &6%{_t}%&a." to {_s}
+
+function eventSetContainers(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::allow::containers} to true
+        send "{@prefix}&aOuverture des conteneurs autorisee dans la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        set {event::allow::containers} to false
+        send "{@prefix}&cOuverture des conteneurs desactivee dans la zone." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event containers <on|off>" to {_s}
+
+function eventSetSwitches(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::allow::switches} to true
+        send "{@prefix}&aBoutons/leviers autorises dans la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        set {event::allow::switches} to false
+        send "{@prefix}&cBoutons/leviers desactives dans la zone." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event switches <on|off>" to {_s}
+
+function eventSetDoors(s: player, mode: text):
+    if {_mode} is "on":
+        set {event::allow::doors} to true
+        send "{@prefix}&aPortes/trappes/portillons autorises dans la zone." to {_s}
+        stop
+    if {_mode} is "off":
+        set {event::allow::doors} to false
+        send "{@prefix}&cPortes/trappes/portillons desactives dans la zone." to {_s}
+        stop
+    send "{@prefix}&cUsage: /event doors <on|off>" to {_s}
+
+function eventSay(s: player, message: text):
+    if eventIsActive() is false:
+        send "{@prefix}&cAucun event en cours." to {_s}
+        stop
+    set {_count} to 0
+    loop all players:
+        if {event::joined::%uuid of loop-player%} is set:
+            send "&8[&6EVENT&8] &f%{_message}%" to loop-player
+            play sound "minecraft:block.note_block.bell" with volume 0.5 with pitch 1.2 to loop-player
+            add 1 to {_count}
+    send "{@prefix}&7Message envoyé à &f%{_count}% &7participants." to {_s}
+
+function eventBroadcast(message: text):
+    broadcast "&8&m-----"
+    broadcast "&6&l[EVENT] &f%{_message}%"
+    broadcast "&8&m-----"
+    loop all players:
+        play sound "minecraft:block.note_block.bell" with volume 0.4 with pitch 1.0 to loop-player
+
+function eventKick(s: player, t: player):
+    if {event::joined::%uuid of {_t}%} is not set:
+        send "{@prefix}&c%name of {_t}% n'est pas dans l'event." to {_s}
+        stop
+    delete {event::joined::%uuid of {_t}%}
+    delete {event::inside::%uuid of {_t}%}
+    delete {event::arrived::%uuid of {_t}%}
+    delete {event::arrival::near::%uuid of {_t}%}
+    delete {event::arrival::step::%uuid of {_t}%}
+    send "{@prefix}&7%name of {_t}% &cretiré de l'event." to {_s}
+    send "{@prefix}&cVous avez été retiré de l'event." to {_t}
+
+command /event [<text>] [<text>] [<text>]:
+    permission: {@perm}
+    permission message: &cTu n'as pas la permission.
+    aliases: ev, ze
+    trigger:
+        if arg-1 is not set:
+            eventCmdHelp(player)
+            stop
+        if arg-1 is "menu":
+            eventOpenMenu(player)
+            stop
+        if arg-1 is "wand":
+            eventGiveWand(player)
+            stop
+        if arg-1 is "start":
+            eventStart(player)
+            stop
+        if arg-1 is "stop":
+            eventStop(player)
+            stop
+        if arg-1 is "status":
+            eventStatus(player)
+            stop
+        if arg-1 is "statut":
+            eventStatus(player)
+            stop
+        if arg-1 is "list":
+            eventList(player)
+            stop
+        if arg-1 is "protect":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event protect <on|off>" to player
+                stop
+            eventSetProtect(player, arg-2)
+            stop
+        if arg-1 is "pvp":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event pvp <on|off>" to player
+                stop
+            eventSetPvp(player, arg-2)
+            stop
+        if arg-1 is "pve":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event pve <on|off>" to player
+                stop
+            eventSetPve(player, arg-2)
+            stop
+        if arg-1 is "arrivalradius":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event arrivalradius <metres>" to player
+                stop
+            eventSetArrivalRadius(player, arg-2)
+            stop
+        if arg-1 is "arrivalblock":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event arrivalblock <on|off>" to player
+                stop
+            eventSetArrivalBlockToggle(player, arg-2)
+            stop
+        if arg-1 is "arrivaltype":
+            if arg-2 is set:
+                eventSetArrivalBlockFromArg(player, arg-2)
+            else:
+                eventSetArrivalBlockFromHand(player)
+            stop
+        if arg-1 is "usey":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event usey <on|off>" to player
+                stop
+            eventSetUseY(player, arg-2)
+            stop
+        if arg-1 is "containers":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event containers <on|off>" to player
+                stop
+            eventSetContainers(player, arg-2)
+            stop
+        if arg-1 is "switches":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event switches <on|off>" to player
+                stop
+            eventSetSwitches(player, arg-2)
+            stop
+        if arg-1 is "doors":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event doors <on|off>" to player
+                stop
+            eventSetDoors(player, arg-2)
+            stop
+        if arg-1 is "point":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event point <set|clear>" to player
+                stop
+            if arg-2 is "set":
+                eventSetPoint(player)
+                stop
+            if arg-2 is "clear":
+                eventClearPoint(player)
+                stop
+            send "{@prefix}&cUsage: /event point <set|clear>" to player
+            stop
+        if arg-1 is "setblock":
+            if arg-2 is set:
+                eventSetBlockFromArg(player, arg-2)
+            else:
+                eventSetBlockFromHand(player)
+            stop
+        if arg-1 is "scan":
+            eventScanCmd(player)
+            stop
+        if arg-1 is "reset":
+            eventClearAllState()
+            delete {event::region::1}
+            delete {event::region::2}
+            delete {event::region::mode}
+            delete {event::region::poly::*}
+            eventPolyClearCache()
+            delete {event::block}
+            delete {event::arrival::radius}
+            delete {event::arrival::needstep}
+            delete {event::arrival::block}
+            delete {event::boundaryfx}
+            delete {event::boundaryfx::last::*}
+            delete {event::usey}
+            delete {event::target::loc}
+            delete {event::allow::containers}
+            delete {event::allow::switches}
+            delete {event::allow::doors}
+            send "{@prefix}&aTout a été réinitialisé." to player
+            stop
+        if arg-1 is "kick":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event kick <joueur>" to player
+                stop
+            set {_t} to arg-2 parsed as offline player
+            if {_t} is not set:
+                send "{@prefix}&cJoueur introuvable." to player
+                stop
+            if {_t} is not online:
+                send "{@prefix}&cCe joueur n'est pas connecté." to player
+                stop
+            eventKick(player, {_t})
+            stop
+        if arg-1 is "say":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event say <message>" to player
+                stop
+            set {_msg} to arg-2
+            if arg-3 is set:
+                set {_msg} to "%arg-2% %arg-3%"
+            eventSay(player, {_msg})
+            stop
+        if arg-1 is "broadcast":
+            if arg-2 is not set:
+                send "{@prefix}&cUsage: /event broadcast <message>" to player
+                stop
+            set {_msg} to arg-2
+            if arg-3 is set:
+                set {_msg} to "%arg-2% %arg-3%"
+            eventBroadcast({_msg})
+            stop
+        eventCmdHelp(player)

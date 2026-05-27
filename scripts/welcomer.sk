@@ -1,0 +1,28 @@
+function isStaff(p: player) :: boolean:
+    if {_p} has permission "staff":
+        return true
+    if {_p} has permission "admin":
+        return true
+    if {_p} has permission "mod":
+        return true
+    return false
+
+on join:
+    if isStaff(player) is true:
+        set join message to ""
+        loop all players:
+            if isStaff(loop-player) is true:
+                send "&7[&a+&7] &7%player%" to loop-player
+        stop
+
+    set join message to "&7[&a+&7] &7%player%"
+
+on quit:
+    if isStaff(player) is true:
+        set quit message to ""
+        loop all players:
+            if isStaff(loop-player) is true:
+                send "&7[&c-&7] &7%player%" to loop-player
+        stop
+
+    set quit message to "&7[&c-&7] &7%player%"

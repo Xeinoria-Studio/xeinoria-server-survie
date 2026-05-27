@@ -1,0 +1,282 @@
+#!===============================================================================
+#! Custom Blocks
+#!===============================================================================
+#! - Block Breaker (dispenser) : casse le bloc devant lui sur signal redstone.
+#!   Utilise l'outil approprie pose dans son inventaire (pioche, hache, pelle,
+#!   cisailles, hoe). L'outil prend de la durabilite.
+#! - Block Placer  (dropper)   : pose un bloc de son inventaire devant lui sur
+#!   signal redstone.
+#!===============================================================================
+
+import:
+    org.bukkit.Sound
+    org.bukkit.Tag
+
+options:
+    perm: customblocks.admin
+    breaker-id: breaker
+    placer-id: placer
+    breaker-name: §6§lBlock Breaker
+    placer-name: §6§lBlock Placer
+
+#!===============================================================================
+#! Commande
+#!===============================================================================
+
+command /cb <text> [<text>]:
+    aliases: /customblocks
+    permission: {@perm}
+    permission message: §cTu n'as pas la permission.
+    trigger:
+        if arg-1 is "give":
+            if arg-2 is "breaker":
+                give cbMakeBreaker() to player
+                send "§a+ §6Block Breaker" to player
+                stop
+            if arg-2 is "placer":
+                give cbMakePlacer() to player
+                send "§a+ §6Block Placer" to player
+                stop
+            send "§c/cb give <breaker|placer>" to player
+            stop
+        if arg-1 is "check":
+            set {_b} to targeted block
+            set {_t} to {cb::%location of {_b}%}
+            send "§7Block: %type of {_b}% Tag: %{_t}%" to player
+            stop
+        send "§c/cb give <breaker|placer> | /cb check" to player
+
+#!===============================================================================
+#! Items
+#!===============================================================================
+
+function cbMakeBreaker() :: item:
+    set {_i} to 1 of dispenser
+    set name of {_i} to "{@breaker-name}"
+    set lore of {_i} to "§7Casse le bloc qu'il regarde", "§7sur signal redstone.", "§7Mets un outil dedans (pioche,", "§7hache, pelle, cisailles)."
+    return {_i}
+
+function cbMakePlacer() :: item:
+    set {_i} to 1 of dropper
+    set name of {_i} to "{@placer-name}"
+    set lore of {_i} to "§7Place un bloc devant lui", "§7sur signal redstone."
+    return {_i}
+
+function cbItemType(i: item) :: text:
+    if {_i} is not set:
+        return ""
+    set {_n} to name of {_i}
+    if {_n} is "{@breaker-name}":
+        return "{@breaker-id}"
+    if {_n} is "{@placer-name}":
+        return "{@placer-id}"
+    return ""
+
+#!===============================================================================
+#! Pose / casse
+#!===============================================================================
+
+on place of dispenser or dropper:
+    set {_tag} to cbItemType(player's tool)
+    if {_tag} is "{@breaker-id}" or "{@placer-id}":
+        set {cb::%location of event-block%} to {_tag}
+        send action bar "§6✦ §7Pose: %{_tag}%" to player
+
+on break of dispenser or dropper:
+    set {_loc} to location of event-block
+    set {_tag} to {cb::%{_loc}%}
+    if {_tag} is "{@breaker-id}" or "{@placer-id}":
+        delete {cb::%{_loc}%}
+        cancel event
+        loop all items in inventory of event-block:
+            drop loop-value at {_loc}
+        clear inventory of event-block
+        set event-block to air
+        if {_tag} is "{@breaker-id}":
+            drop cbMakeBreaker() at {_loc}
+        else:
+            drop cbMakePlacer() at {_loc}
+
+#!===============================================================================
+#! Activation
+#!===============================================================================
+
+on dispense:
+    set {_b} to event-block
+    set {_tag} to {cb::%location of {_b}%}
+    if {_tag} is "{@breaker-id}":
+        event.setCancelled(true)
+        set {_dir} to {_b}.getBlockData().getFacing()
+        set {_front} to {_b}.getRelative({_dir})
+        cbBreakerFire({_b}, {_front})
+    else if {_tag} is "{@placer-id}":
+        event.setCancelled(true)
+        set {_dir} to {_b}.getBlockData().getFacing()
+        set {_front} to {_b}.getRelative({_dir})
+        cbPlacerFire({_b}, {_front})
+
+#!===============================================================================
+#! Selection d'outil dans l'inventaire du breaker
+#!===============================================================================
+
+function cbIsTool(i: item) :: boolean:
+    if {_i} is not set:
+        return false
+    set {_t} to type of {_i}
+    if {_t} is wooden pickaxe, stone pickaxe, iron pickaxe, golden pickaxe, diamond pickaxe, or netherite pickaxe:
+        return true
+    if {_t} is wooden axe, stone axe, iron axe, golden axe, diamond axe, or netherite axe:
+        return true
+    if {_t} is wooden shovel, stone shovel, iron shovel, golden shovel, diamond shovel, or netherite shovel:
+        return true
+    if {_t} is wooden hoe, stone hoe, iron hoe, golden hoe, diamond hoe, or netherite hoe:
+        return true
+    if {_t} is shears:
+        return true
+    return false
+
+function cbFindToolSlot(b: block) :: number:
+    set {_inv} to inventory of {_b}
+    set {_idx} to 0
+    loop 9 times:
+        set {_slot} to slot {_idx} of {_inv}
+        if cbIsTool({_slot}) is true:
+            return {_idx}
+        add 1 to {_idx}
+    return -1
+
+# Renvoie la categorie d'outil adaptee au bloc :
+# "axe", "pickaxe", "shovel", "hoe", "shears", "none" (cassable a la main / inconnu)
+function cbBlockToolKind(b: block) :: text:
+    set {_m} to {_b}.getType()
+    if Tag.MINEABLE_PICKAXE.isTagged({_m}) is true:
+        return "pickaxe"
+    if Tag.MINEABLE_AXE.isTagged({_m}) is true:
+        return "axe"
+    if Tag.MINEABLE_SHOVEL.isTagged({_m}) is true:
+        return "shovel"
+    if Tag.MINEABLE_HOE.isTagged({_m}) is true:
+        return "hoe"
+    if Tag.LEAVES.isTagged({_m}) is true:
+        return "shears"
+    if Tag.WOOL.isTagged({_m}) is true:
+        return "shears"
+    return "none"
+
+# Renvoie la categorie de l'item, ou "none"
+function cbItemKind(i: item) :: text:
+    if {_i} is not set:
+        return "none"
+    set {_n} to "%{_i}.getType().name()%"
+    if {_n} ends with "_PICKAXE":
+        return "pickaxe"
+    if {_n} ends with "_AXE":
+        return "axe"
+    if {_n} ends with "_SHOVEL":
+        return "shovel"
+    if {_n} ends with "_HOE":
+        return "hoe"
+    if {_n} is "SHEARS":
+        return "shears"
+    return "none"
+
+# Cherche dans l'inventaire un outil de la categorie demandee. -1 sinon.
+function cbFindToolSlotByKind(b: block, kind: text) :: number:
+    set {_inv} to inventory of {_b}
+    set {_idx} to 0
+    loop 9 times:
+        set {_slot} to slot {_idx} of {_inv}
+        if cbItemKind({_slot}) is {_kind}:
+            return {_idx}
+        add 1 to {_idx}
+    return -1
+
+# Choisit aleatoirement un slot contenant un outil quelconque, -1 sinon.
+function cbFindRandomToolSlot(b: block) :: number:
+    set {_inv} to inventory of {_b}
+    set {_idx} to 0
+    delete {_cands::*}
+    loop 9 times:
+        set {_slot} to slot {_idx} of {_inv}
+        if cbIsTool({_slot}) is true:
+            add {_idx} to {_cands::*}
+        add 1 to {_idx}
+    if size of {_cands::*} = 0:
+        return -1
+    return random element out of {_cands::*}
+
+#!===============================================================================
+#! Fonctions de tir
+#!===============================================================================
+
+function cbBreakerFire(self: block, front: block):
+    set {_loc} to location of {_front}
+    set {_type} to type of {_front}
+    if {_type} is air:
+        stop
+    if {_type} is bedrock, barrier, command block, structure block, end portal, end portal frame, or nether portal:
+        stop
+    set {_inv} to inventory of {_self}
+    # On parcourt l'inventaire et on teste chaque outil avec getDrops :
+    # le "bon" outil est celui qui produit reellement des drops pour ce bloc.
+    # Si aucun outil ne produit de drops, on retombe sur un outil au hasard
+    # (ou rien) -> breakNaturally s'occupera du cas hand-breakable / no-drop.
+    set {_idx} to -1
+    set {_i} to 0
+    delete {_tools::*}
+    loop 9 times:
+        set {_slot} to slot {_i} of {_inv}
+        if cbIsTool({_slot}) is true:
+            add {_i} to {_tools::*}
+            if {_idx} < 0:
+                set {_drops::*} to {_front}.getDrops({_slot})
+                if size of {_drops::*} > 0:
+                    set {_idx} to {_i}
+        add 1 to {_i}
+    # pas d'outil "adapte" -> outil au hasard parmi ceux dispo
+    if {_idx} < 0:
+        if size of {_tools::*} > 0:
+            set {_idx} to random element out of {_tools::*}
+    set {_tool} to null
+    if {_idx} >= 0:
+        set {_tool} to slot {_idx} of {_inv}
+    # breakNaturally gere correctement drops + outil + air
+    if {_tool} is null:
+        set {_ok} to {_front}.breakNaturally()
+    else:
+        set {_ok} to {_front}.breakNaturally({_tool})
+    if {_ok} is false:
+        stop
+    play sound "block.stone.break" at {_loc} for all players in radius 16 around {_loc}
+    # endommager l'outil si on en a utilise un
+    if {_tool} is not null:
+        set {_meta} to {_tool}.getItemMeta()
+        set {_max} to {_tool}.getType().getMaxDurability()
+        if {_max} > 0:
+            set {_dmg} to {_meta}.getDamage()
+            if ({_dmg} + 1) >= {_max}:
+                set slot {_idx} of {_inv} to air
+                play sound "entity.item.break" at location of {_self} for all players in radius 16 around {_self}
+            else:
+                {_meta}.setDamage({_dmg} + 1)
+                {_tool}.setItemMeta({_meta})
+                set slot {_idx} of {_inv} to {_tool}
+
+function cbPlacerFire(self: block, front: block):
+    set {_world} to world of {_front}
+    set {_loc} to location of {_front}
+    set {_ftype} to type of {_front}
+    if {_ftype} is not air:
+        stop
+    set {_inv} to inventory of {_self}
+    set {_idx} to 0
+    loop 9 times:
+        set {_slot} to slot {_idx} of {_inv}
+        if {_slot} is set:
+            set {_t} to type of {_slot}
+            if {_t} is a block:
+                set block at {_loc} to {_t}
+                remove 1 of {_t} from {_inv}
+                {_world}.playSound({_loc}, Sound.BLOCK_STONE_PLACE, 1, 1)
+                stop
+        add 1 to {_idx}

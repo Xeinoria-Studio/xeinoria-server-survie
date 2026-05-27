@@ -1,0 +1,137 @@
+#!===============================================================================
+#! Daily Midnight Difficulty & Phantom Announcement
+#!===============================================================================
+#! À minuit (00:00), annonce que la difficulté passe à DIFFICILE pendant 30 min
+#! et active les Phantoms pour le farming.
+#! Optimisé: une seule variable persistante (timestamp).
+#!===============================================================================
+
+function getGameWorld() :: world:
+    return world "sv"
+
+function broadcastAnnouncement():
+    broadcast "&f[&e⚡ &eMINUIT&e ⚡&f]"
+    broadcast "&c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    broadcast "&fDifficulté changée à &c[DIFFICILE]&f pendant &c30 minutes"
+    broadcast "&fLes &b[PHANTOMS]&f sont &aACTIVÉS&f"
+    broadcast "&eParfait pour farmer les succès!"
+    broadcast "&c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+function enableHardDifficulty():
+    set {_world} to getGameWorld()
+    if {_world} is set:
+        set the difficulty of {_world} to hard
+
+function disableHardDifficulty():
+    set {_world} to getGameWorld()
+    if {_world} is set:
+        set the difficulty of {_world} to normal
+        broadcast "&7[&6INFO&7] Difficulté revenue à &eNORMALE"
+    # Nettoyer la variable
+    delete {midnight-difficulty-timestamp}
+
+function activateMidnightDifficulty():
+    set {midnight-difficulty-timestamp} to unix timestamp of now
+    broadcastAnnouncement()
+    enableHardDifficulty()
+
+function checkAndResetMidnightDifficulty():
+    # Si aucune période difficile n'est active, rien à faire
+    if {midnight-difficulty-timestamp} is not set:
+        stop
+    
+    set {_elapsed} to (unix timestamp of now) - {midnight-difficulty-timestamp}
+    # Si plus de 30 min (1800 secondes) ont passé, reset
+    if {_elapsed} is greater than 1800:
+        disableHardDifficulty()
+
+# On load: vérifier si une période difficile était active
+on load:
+    checkAndResetMidnightDifficulty()
+
+# Vérifier toutes les minutes si le délai de 30 min est écoulé
+on every 60 seconds:
+    checkAndResetMidnightDifficulty()
+
+# Trigger at midnight every day
+at 00:00 in real time:
+    activateMidnightDifficulty()
+
+#!===============================================================================
+#! Commande de Debug
+#!===============================================================================
+
+command /midnightdebug [<text>]:
+    permission: admin
+    permission message: &cTu n'as pas la permission!
+    trigger:
+        set {_arg} to arg-1 if arg-1 is set else "status"
+        if {_arg} is set:
+            set {_arg} to lowercase {_arg}
+        
+        if {_arg} is "activate":
+            send "&f[&eMIDNIGHT DEBUG&f] &aActivation manuelle du cycle..." to player
+            activateMidnightDifficulty()
+            send "&f[&eMIDNIGHT DEBUG&f] &eTimestamp sauvegardé: &f{midnight-difficulty-timestamp}" to player
+            send "&f[&eMIDNIGHT DEBUG&f] &aTest activation complété!" to player
+        
+        else if {_arg} is "reset":
+            send "&f[&eMIDNIGHT DEBUG&f] &cRéinitialisation..." to player
+            disableHardDifficulty()
+            send "&f[&eMIDNIGHT DEBUG&f] &aRéinitialisation complétée!" to player
+        
+        else if {_arg} is "status":
+            set {_world} to getGameWorld()
+            set {_diff} to the difficulty of {_world}
+            set {_timestamp} to {midnight-difficulty-timestamp}
+            set {_is_active} to "NON"
+            
+            if {_timestamp} is set:
+                set {_is_active} to "OUI"
+                set {_elapsed} to (unix timestamp of now) - {_timestamp}
+                set {_remaining} to 1800 - {_elapsed}
+                if {_remaining} is less than 0:
+                    set {_remaining} to 0
+                send "&f[&eMIDNIGHT DEBUG&f] &6Status:" to player
+                send "&f  • Monde: &e%{_world}%" to player
+                send "&f  • Difficulté actuelle: &e%{_diff}%" to player
+                send "&f  • Cycle actif: &e%{_is_active}%" to player
+                send "&f  • Timestamp: &e%{_timestamp}%" to player
+                send "&f  • Temps écoulé: &e%{_elapsed}%s" to player
+                send "&f  • Temps restant: &e%{_remaining}%s (&a%{_remaining}%/1800&e)" to player
+            else:
+                send "&f[&eMIDNIGHT DEBUG&f] &6Status:" to player
+                send "&f  • Monde: &e%{_world}%" to player
+                send "&f  • Difficulté actuelle: &e%{_diff}%" to player
+                send "&f  • Cycle actif: &e%{_is_active}%" to player
+                send "&f  • Pas de cycle en cours" to player
+        
+        else if {_arg} is "check":
+            send "&f[&eMIDNIGHT DEBUG&f] &6Diagnostic complet:" to player
+            set {_world} to getGameWorld()
+            
+            if {_world} is set:
+                send "&f  ✓ Monde 'sv' trouvé" to player
+            else:
+                send "&f  ✗ ERREUR: Monde 'sv' non trouvé!" to player
+            
+            set {_diff} to the difficulty of {_world}
+            send "&f  • Difficulté: &e%{_diff}%" to player
+            
+            set {_player_count} to number of all players
+            send "&f  • Joueurs en ligne: &e%{_player_count}%" to player
+            
+            send "&f  • Variables persistantes: &e%{midnight-difficulty-timestamp}% (vide = aucun cycle)" to player
+            send "&f  ✓ Diagnostic terminé" to player
+        
+        else if {_arg} is "help":
+            send "&e========== MIDNIGHT DEBUG HELP ==========" to player
+            send "&f/midnightdebug status   &7- Affiche le status du cycle" to player
+            send "&f/midnightdebug activate &7- Force l'activation du cycle" to player
+            send "&f/midnightdebug reset    &7- Force la réinitialisation" to player
+            send "&f/midnightdebug check    &7- Diagnostic complet" to player
+            send "&f/midnightdebug help    &7- Affiche cette aide" to player
+            send "&e========================================" to player
+        
+        else:
+            send "&cArgument invalide! Utilise &f/midnightdebug help" to player

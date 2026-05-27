@@ -1,0 +1,71 @@
+# Drop la tête en trophée uniquement à la 1ère mort par un joueur
+
+on death of player:
+    attacker is a player
+    victim is a player
+
+    # Clé unique par joueur (UUID) pour éviter les soucis si le pseudo change
+    set {_id} to uuid of victim
+
+    # Déjà eu son trophée ? -> rien
+    if {trophy::%{_id}%} is set:
+        stop
+
+    # Marque que c'était la 1ère mort par joueur
+    set {trophy::%{_id}%} to true
+
+    # Création de la tête
+    set {_h} to skull of victim
+    set name of {_h} to "&6&lTrophée de &e&l%victim%"
+
+    # Lore (comme tu l'as demandé)
+    add "&7--------------------------" to lore of {_h}
+    add "&fMort le: &b%now%" to lore of {_h}
+    add "&fTueur: &c%attacker%" to lore of {_h}
+    add "&fLieu: &7X: %x-coord of victim%, Y: %y-coord of victim%, Z: %z-coord of victim%" to lore of {_h}
+    add "&7--------------------------" to lore of {_h}
+
+    # Drop au sol à l'endroit de la mort
+    drop {_h} at location of victim
+
+    command /trophydebug [<player>] [<text>]:
+    permission: trophy.debug
+    permission message: &cTu n'as pas la permission.
+    trigger:
+        if arg-1 is not set:
+            send "&6=== &eTrophy Debug &6==="
+            send "&7/trophydebug <joueur> status"
+            send "&7/trophydebug <joueur> reset"
+            send "&7/trophydebug <joueur> give"
+            stop
+
+        set {_p} to arg-1
+        set {_id} to uuid of {_p}
+
+        if arg-2 is "status":
+            if {trophy::%{_id}%} is set:
+                send "&a%{_p}% a déjà déclenché son trophée."
+            else:
+                send "&c%{_p}% n'a pas encore déclenché son trophée."
+            stop
+
+        if arg-2 is "reset":
+            delete {trophy::%{_id}%}
+            send "&aTrophée de %{_p}% réinitialisé."
+            stop
+
+        if arg-2 is "give":
+            set {_h} to skull of {_p}
+            set name of {_h} to "&6&lTrophée de &e&l%{_p}%"
+
+            add "&7--------------------------" to lore of {_h}
+            add "&fMort le: &b%now%" to lore of {_h}
+            add "&fTueur: &cConsole (debug)" to lore of {_h}
+            add "&fLieu: &7X: %x-coord of {_p}%, Y: %y-coord of {_p}%, Z: %z-coord of {_p}%" to lore of {_h}
+            add "&7--------------------------" to lore of {_h}
+
+            give {_h} to player
+            send "&aTrophée de %{_p}% donné en debug."
+            stop
+
+        send "&cAction inconnue. Utilise: status, reset ou give."

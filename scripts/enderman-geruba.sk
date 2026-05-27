@@ -1,0 +1,312 @@
+#!===============================================================================
+#! Enderman-Geruba
+#!===============================================================================
+#! Cible : Geruba (uniquement, sur le serveur survie).
+#! Comportement enderman : quand il prend des degats, il se teleporte
+#! aleatoirement dans un rayon autour de sa position actuelle (jusqu'a 5
+#! tentatives pour trouver un endroit safe).
+#!===============================================================================
+
+options:
+    target-name: Geruba
+    tp-radius: 12
+    tp-attempts: 8
+    tp-min-y-offset: -4
+    tp-max-y-offset: 4
+    cooldown-ticks: 10
+    water-damage: 1
+    water-period: 1.25 seconds
+    particle-period: 8 ticks
+    particle-view-radius: 24
+    particle-count: 12
+    pearl-damage-window: 12 ticks
+    spell-cooldown: 3 seconds
+    hit-tp-chance-above-half: 65
+
+function endermanGerubaIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function endermanGerubaIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function endermanGerubaIsSword(it: itemstack) :: boolean:
+    if {_it} is wooden sword:
+        return true
+    if {_it} is stone sword:
+        return true
+    if {_it} is iron sword:
+        return true
+    if {_it} is golden sword:
+        return true
+    if {_it} is diamond sword:
+        return true
+    if {_it} is netherite sword:
+        return true
+    return false
+
+function endermanGerubaCanCastWith(it: itemstack) :: boolean:
+    if endermanGerubaIsSword({_it}) is false:
+        return false
+    if {_it} is enchanted:
+        return true
+    return false
+
+function endermanGerubaIsGrounded(p: player) :: boolean:
+    set {_below} to block at location 1 below {_p}
+    if endermanGerubaIsHazard({_below}) is true:
+        return false
+    if endermanGerubaIsPassable({_below}) is true:
+        return false
+    return true
+
+on damage of player:
+    if endermanGerubaIsTarget(victim) is false:
+        stop
+    if endermanGerubaIsInactive(victim) is true:
+        stop
+    play sound "entity.enderman.hurt" with volume 1 and pitch 1 at location of victim for all players in radius 32 around location of victim
+    if {endermanGeruba::lastPearlTp::%uuid of victim%} is set:
+        if difference between now and {endermanGeruba::lastPearlTp::%uuid of victim%} <= {@pearl-damage-window}:
+            cancel event
+            stop
+    # Pas de TP sur fall damage
+    if damage cause is fall:
+        stop
+    endermanGerubaOnHit(victim)
+
+on death of player:
+    if endermanGerubaIsTarget(victim) is false:
+        stop
+    play sound "entity.enderman.death" with volume 1.2 and pitch 1 at location of victim for all players in radius 48 around location of victim
+
+on right click with ender pearl:
+    if endermanGerubaIsTarget(player) is false:
+        stop
+    if endermanGerubaIsInactive(player) is true:
+        stop
+    set {endermanGeruba::lastPearlTp::%uuid of player%} to now
+
+on right click:
+    if endermanGerubaIsTarget(player) is false:
+        stop
+    if endermanGerubaIsInactive(player) is true:
+        stop
+    if endermanGerubaCanCastWith(tool of player) is false:
+        stop
+    if endermanGerubaIsGrounded(player) is false:
+        stop
+    if {endermanGeruba::spellCooldown::%uuid of player%} is set:
+        if difference between {endermanGeruba::spellCooldown::%uuid of player%} and now < "{@spell-cooldown}" parsed as timespan:
+            stop
+    set {endermanGeruba::spellCooldown::%uuid of player%} to now
+    endermanGerubaTeleportNow(player)
+
+on teleport:
+    if endermanGerubaIsTarget(player) is false:
+        stop
+    if endermanGerubaIsInactive(player) is true:
+        stop
+    if teleport cause is ender pearl:
+        set {endermanGeruba::lastPearlTp::%uuid of player%} to now
+
+# Tick periodique : prendre des degats si en contact avec de l'eau ou pluie.
+every {@water-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is online:
+        if endermanGerubaIsInactive({_p}) is true:
+            stop
+        endermanGerubaWaterTick({_p})
+
+# Aura enderman legere et visible pour les joueurs autour.
+every {@particle-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is online:
+        if endermanGerubaIsInactive({_p}) is true:
+            stop
+        endermanGerubaAmbientFx({_p})
+
+function endermanGerubaWaterTick(p: player):
+    if endermanGerubaIsInactive({_p}) is true:
+        stop
+    if endermanGerubaIsWet({_p}) is false:
+        stop
+    if endermanGerubaResistsWater({_p}) is true:
+        stop
+    damage {_p} by {@water-damage}
+    play sound "entity.enderman.hurt" with volume 0.6 and pitch 1.4 at {_p}
+    send action bar "§9L'eau te brûle !" to {_p}
+
+function endermanGerubaAmbientFx(p: player):
+    if endermanGerubaIsInactive({_p}) is true:
+        stop
+    if endermanGerubaShouldShowParticles({_p}) is false:
+        stop
+    loop all players in radius {@particle-view-radius} around {_p}:
+        show {@particle-count} "portal" particles at location of {_p} for loop-player
+
+function endermanGerubaShouldShowParticles(p: player) :: boolean:
+    # Cache reseau/skin (gere par hideplayer.sk)
+    if {hidden::%uuid of {_p}%} is true:
+        return false
+
+    # Vanish PremiumVanish
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return false
+
+    # Invisibilite potion
+    if {_p} has invisibility:
+        return false
+
+    # Casques de camouflage (meme logique que hideplayer.sk)
+    set {_h} to helmet of {_p}
+    if {_h} is carved pumpkin or pumpkin:
+        return false
+    if {_h} is creeper head or zombie head or skeleton skull or wither skeleton skull or dragon head:
+        return false
+
+    return true
+
+# Vrai si le joueur a au moins une protection :
+#   - effet potion "water breathing" ou "conduit power"
+#   - casque enchante "respiration" (>=1) ou "aqua affinity" (>=1)
+function endermanGerubaResistsWater(p: player) :: boolean:
+    if {_p} has water breathing:
+        return true
+    if {_p} has conduit power:
+        return true
+    set {_h} to helmet of {_p}
+    if {_h} is not air:
+        if level of respiration of {_h} >= 1:
+            return true
+        if level of aqua affinity of {_h} >= 1:
+            return true
+    return false
+
+# Vrai si le joueur touche de l'eau (corps/tete) ou est expose a la pluie.
+# Le casque protege uniquement contre la pluie (pas contre l'eau-bloc).
+function endermanGerubaIsWet(p: player) :: boolean:
+    if block at {_p} is water:
+        return true
+    if block at location 1 above {_p} is water:
+        return true
+    set {_w} to world of {_p}
+    if {_w} is raining:
+        if helmet of {_p} is air:
+            # Expose a la pluie : sky-light max au-dessus de la tete
+            if sunlight level at location 1 above {_p} >= 14:
+                return true
+    return false
+
+# Tente une teleportation enderman.
+function endermanGerubaOnHit(p: player):
+    if endermanGerubaIsInactive({_p}) is true:
+        stop
+    # Pas de tp si le joueur sneake.
+    if {_p} is sneaking:
+        stop
+    # Au-dessus de la moitie de vie: chance reduite de TP.
+    # A 50% HP ou moins: comportement d'avant (TP a chaque hit).
+    set {_half} to (max health of {_p}) / 2
+    if health of {_p} > {_half}:
+        set {_roll} to random integer between 1 and 100
+        if {_roll} > {@hit-tp-chance-above-half}:
+            stop
+    # Anti-spam : ne tp pas plus d'une fois par cooldown.
+    if {endermanGeruba::cooldown::%uuid of {_p}%} is set:
+        if difference between {endermanGeruba::cooldown::%uuid of {_p}%} and now < "{@cooldown-ticks} ticks" parsed as timespan:
+            stop
+    set {endermanGeruba::cooldown::%uuid of {_p}%} to now
+    endermanGerubaTeleportNow({_p})
+
+function endermanGerubaTeleportNow(p: player):
+    set {_dest} to endermanGerubaFindSafeSpot({_p})
+    if {_dest} is set:
+        teleport {_p} to {_dest}
+        play sound "entity.enderman.teleport" with volume 1 and pitch 1 at {_p} for {_p}
+        play sound "entity.enderman.teleport" with volume 1 and pitch 1 at {_p}
+        if endermanGerubaShouldShowParticles({_p}) is true:
+            loop all players in radius {@particle-view-radius} around {_p}:
+                show 16 "portal" particles at location of {_p} for loop-player
+        send action bar "§5Vwoop !" to {_p}
+
+# Cherche un point d'arrivee valide ; renvoie une location ou ne renvoie rien.
+function endermanGerubaFindSafeSpot(p: player) :: location:
+    loop {@tp-attempts} times:
+        set {_cand} to endermanGerubaRandomCandidate({_p})
+        if endermanGerubaIsSafe({_cand}) is true:
+            return {_cand}
+    return {none}
+
+function endermanGerubaRandomCandidate(p: player) :: location:
+    set {_loc} to location of {_p}
+    set {_dx} to a random integer between (-1 * {@tp-radius}) and {@tp-radius}
+    set {_dz} to a random integer between (-1 * {@tp-radius}) and {@tp-radius}
+    set {_dy} to a random integer between {@tp-min-y-offset} and {@tp-max-y-offset}
+    set {_cand} to location ((x-coord of {_loc}) + {_dx}), ((y-coord of {_loc}) + {_dy}), ((z-coord of {_loc}) + {_dz}) in world of {_p}
+    return {_cand}
+
+# Une location est "safe" si :
+#   - les 2 blocs au niveau du joueur sont passables (air-like)
+#   - le bloc en dessous est solide
+#   - aucun des 3 blocs n'est lave/eau (eviter de tp dans la lave)
+function endermanGerubaIsSafe(loc: location) :: boolean:
+    set {_feet} to block at {_loc}
+    set {_head} to block at location 1 above {_loc}
+    set {_below} to block at location 1 below {_loc}
+    if endermanGerubaIsHazard({_feet}) is true:
+        return false
+    if endermanGerubaIsHazard({_head}) is true:
+        return false
+    if endermanGerubaIsHazard({_below}) is true:
+        return false
+    if endermanGerubaIsPassable({_feet}) is false:
+        return false
+    if endermanGerubaIsPassable({_head}) is false:
+        return false
+    if endermanGerubaIsPassable({_below}) is true:
+        return false
+    return true
+
+function endermanGerubaIsPassable(b: block) :: boolean:
+    if {_b} is air or cave air or void air:
+        return true
+    if {_b} is short grass or tall grass or fern or large fern:
+        return true
+    return false
+
+function endermanGerubaIsHazard(b: block) :: boolean:
+    if {_b} is lava or fire or soul fire or magma block or campfire or soul campfire:
+        return true
+    return false
+
+#!===============================================================================
+#! DEBUG : /gerubacheck [joueur]
+#!===============================================================================
+#! Force une teleportation enderman a la position courante (sans degats).
+#! Sert a tester la logique sans frapper le joueur.
+#!===============================================================================
+
+command /gerubacheck [<player>]:
+    permission: endermangeruba.debug
+    trigger:
+        set {_p} to arg-1
+        if {_p} is not set:
+            set {_p} to "{@target-name}" parsed as player
+        if {_p} is not online:
+            send "&cJoueur introuvable / hors-ligne." to sender
+            stop
+        send "&e[EndermanGeruba debug] tp test sur &f%{_p}%&e..." to sender
+        delete {endermanGeruba::cooldown::%uuid of {_p}%}
+        endermanGerubaOnHit({_p})

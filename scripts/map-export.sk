@@ -1,0 +1,2890 @@
+# ==============================================================================
+#  XEINORIA - Map Export (survie)
+#
+#  - Coordonne save-off / save-on avec le script bash export_map.sh
+#  - Expose /mapexport (sous-commandes) + /mapexport menu (GUI chest)
+#  - Permet de configurer en jeu : frequence auto, retention, acces public
+# ==============================================================================
+
+import:
+    java.lang.ProcessBuilder
+    java.util.Scanner
+    java.io.File
+
+options:
+    me_prefix: &6[Map]&r
+    me_script: /home/debian/xeinoria/survie/scripts/export_map.sh
+    me_scripts_dir: /home/debian/xeinoria/survie/scripts
+    me_save_off_req: /home/debian/xeinoria/survie/scripts/.export_save_off_request
+    me_save_off_done: /home/debian/xeinoria/survie/scripts/.export_save_off_done
+    me_save_on_req: /home/debian/xeinoria/survie/scripts/.export_save_on_request
+    me_gui_title: &6XEINORIA &7- &fMap Export
+    me_gui_settings_title: &6XEINORIA &7- &fParametres avances
+    me_gui_person_title: &6XEINORIA &7- &fDetails utilisateur
+    me_gui_access_title: &6XEINORIA &7- &fListe d'acces
+    me_gui_bw_title: &6XEINORIA &7- &fBande passante
+    me_gui_versions_title: &6XEINORIA &7- &fSauvegardes
+    # LiteBans DB (mêmes credentials que fail2ban.sk)
+    me_db_user: user
+    me_db_pass: password
+    me_db_name: minecraft
+    # Vue téléchargements
+    me_gui_dl_title: &6XEINORIA &7- &fTelecharger
+    me_dl_log: /home/debian/xeinoria/survie/scripts/.dl_history
+
+# ==============================================================================
+#  Helpers shell / file
+# ==============================================================================
+
+function meRunShell(cmd: text) :: text:
+    set {_pb} to new ProcessBuilder("bash", "-lc", {_cmd})
+    {_pb}.redirectErrorStream(true)
+    set {_process} to {_pb}.start()
+    set {_scanner} to new Scanner({_process}.getInputStream()).useDelimiter("\\A")
+    if {_scanner}.hasNext() is true:
+        set {_out} to {_scanner}.next()
+    else:
+        set {_out} to ""
+    {_process}.waitFor()
+    return {_out}
+
+function meFileExists(path: text) :: boolean:
+    set {_f} to new File({_path})
+    return {_f}.exists()
+
+function meTouchFile(path: text):
+    set {_f} to new File({_path})
+    {_f}.createNewFile()
+
+function meDeleteFile(path: text):
+    set {_f} to new File({_path})
+    {_f}.delete()
+
+function meBroadcastPlayers(msg: text):
+    broadcast "{@me_prefix} %{_msg}%"
+
+function meCfgGet(key: text) :: text:
+    # Cache 3s sur tout le blob `config list` pour eviter N forks bash
+    # quand un menu lit plusieurs cles d'affilee.
+    set {_now_s} to unix timestamp of now
+    set {_blob} to "%{me_cache_cfg_blob}%"
+    if {me_cache_cfg_ts} is not set:
+        set {_blob} to ""
+    else if {_now_s} - {me_cache_cfg_ts} > 3:
+        set {_blob} to ""
+    if {_blob} is "":
+        set {_blob} to meRunShell("{@me_script} config 2>/dev/null")
+        set {me_cache_cfg_blob} to {_blob}
+        set {me_cache_cfg_ts} to {_now_s}
+    set {_needle} to "%{_key}%="
+    loop split {_blob} at newline:
+        if loop-value starts with {_needle}:
+            set {_out} to subtext of loop-value from characters (length of {_needle} + 1) to length of loop-value
+            replace all newline with "" in {_out}
+            return {_out}
+    return ""
+
+function meCfgSet(key: text, value: text):
+    meRunShell("{@me_script} config set %{_key}% %{_value}%")
+    # Invalide le cache cfg
+    delete {me_cache_cfg_ts}
+    delete {me_cache_cfg_blob}
+
+function meInvalidateCache():
+    delete {me_cache_cfg_ts}
+    delete {me_cache_cfg_blob}
+    delete {me_cache_status_ts}
+    delete {me_cache_status_blob}
+
+# --- Config JSON (norath-web /api/dl-cfg) : VPN, ban, captcha, max_gb ---
+function meDlCfgGet(key: text) :: text:
+    set {_cmd} to "curl -s --max-time 2 'http://localhost:8080/api/dl-cfg' 2>/dev/null | jq -r '.%{_key}% // empty' 2>/dev/null"
+    set {_out} to meRunShell({_cmd})
+    replace all newline with "" in {_out}
+    return {_out}
+
+function meDlCfgSet(key: text, value: text):
+    # value est un JSON literal (true/false/nombre)
+    # \042 = " (octal), evite le quoting infernal en Skript
+    set {_cmd} to "printf '{\042%{_key}%\042:%{_value}%}' | curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-cfg' >/dev/null 2>&1"
+    meRunShell({_cmd})
+
+function meStatusValue(key: text) :: text:
+    # Cache 3s sur tout le blob `status` pour eviter N forks bash
+    # quand un menu lit plusieurs cles d'affilee.
+    set {_now_s} to unix timestamp of now
+    set {_blob} to "%{me_cache_status_blob}%"
+    if {me_cache_status_ts} is not set:
+        set {_blob} to ""
+    else if {_now_s} - {me_cache_status_ts} > 3:
+        set {_blob} to ""
+    if {_blob} is "":
+        set {_blob} to meRunShell("{@me_script} status 2>/dev/null")
+        set {me_cache_status_blob} to {_blob}
+        set {me_cache_status_ts} to {_now_s}
+    set {_needle} to "%{_key}%="
+    loop split {_blob} at newline:
+        if loop-value starts with {_needle}:
+            set {_out} to subtext of loop-value from characters (length of {_needle} + 1) to length of loop-value
+            replace all newline with "" in {_out}
+            return {_out}
+    return ""
+
+# Lit une cle dans le fichier de progression (atomique, ecrit par export_map.sh)
+function meReadProgress(key: text) :: text:
+    set {_out} to meRunShell("grep -m1 '^%{_key}%=' '{@me_scripts_dir}/.export_progress' 2>/dev/null | sed 's/^[^=]*=//' || true")
+    replace all newline with "" in {_out}
+    return {_out}
+
+# Retourne true si une phase 'active' (export en cours) est detectee
+function meIsActivePhase(v: text) :: boolean:
+    if {_v} is "starting":
+        return true
+    if {_v} is "save_off":
+        return true
+    if {_v} is "zipping":
+        return true
+    if {_v} is "verifying":
+        return true
+    if {_v} is "finalizing":
+        return true
+    return false
+
+# Barre de progression 10 blocs (ex: "&a█████&7░░░░░")
+function meProgressBar(pct: number) :: text:
+    set {_filled} to floor({_pct} / 10)
+    if {_filled} > 10:
+        set {_filled} to 10
+    if {_filled} < 0:
+        set {_filled} to 0
+    set {_a} to ""
+    set {_b} to ""
+    if {_filled} > 0:
+        loop {_filled} times:
+            set {_a} to "%{_a}%█"
+    set {_empty_count} to 10 - {_filled}
+    if {_empty_count} > 0:
+        loop {_empty_count} times:
+            set {_b} to "%{_b}%░"
+    return "&a%{_a}%&7%{_b}%"
+
+# Formatte un ETA en secondes en texte lisible
+function meEtaDisplay(eta: number) :: text:
+    if {_eta} <= 0:
+        return "&7calcul..."
+    set {_m} to floor({_eta} / 60)
+    set {_s} to {_eta} - ({_m} * 60)
+    if {_m} >= 60:
+        set {_h} to floor({_m} / 60)
+        set {_rm} to {_m} - ({_h} * 60)
+        return "&f%{_h}%h %{_rm}%m"
+    if {_m} > 0:
+        return "&f%{_m}%m %{_s}%s"
+    return "&f%{_s}%s"
+
+# Retourne le texte brut formaté à partir du cache pour l'affichage joueur.
+# Format "id IP — PCT% (done/total) - elapsed" pipe-séparés, ou "none" si vide.
+# Lit uniquement depuis le cache (pas de curl) pour ne pas bloquer.
+function meGetDlActive() :: text:
+    {me_dl::count} is set
+    {me_dl::count} > 0
+    set {_out} to ""
+    loop {me_dl::lines::*}:
+        if {_out} is "":
+            set {_out} to loop-value
+        else:
+            set {_out} to "%{_out}%|%loop-value%"
+    if {_out} is "":
+        return "none"
+    return {_out}
+
+# Résoud une IP en pseudo(s) connus via LiteBans (litebans_history).
+# Retourne "name1, name2, ..." ou "" si aucune correspondance.
+function meResolvePseudos(ip: text) :: text:
+    if {_ip} is not set:
+        return ""
+    if {_ip} is "":
+        return ""
+    if {_ip} does not match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$":
+        return ""
+    set {_sql} to "SELECT DISTINCT name FROM litebans_history WHERE ip='%{_ip}%' AND name IS NOT NULL AND name<>'' ORDER BY date DESC LIMIT 5;"
+    set {_cmd} to "mysql --batch --skip-column-names -u{@me_db_user} -p{@me_db_pass} -D {@me_db_name} --execute=""%{_sql}%"" 2>/dev/null"
+    set {_raw} to meRunShell({_cmd})
+    set {_result} to ""
+    if {_raw} is "":
+        return ""
+    loop split {_raw} at newline:
+        set {_line} to loop-value
+        replace all " " with "" in {_line}
+        replace all "\r" with "" in {_line}
+        replace all "\t" with "" in {_line}
+        if {_line} matches "^[a-zA-Z0-9_]{2,16}$":
+            if {_result} is "":
+                set {_result} to {_line}
+            else:
+                set {_result} to "%{_result}%, %{_line}%"
+    return {_result}
+
+# Parse une chaîne "name1, name2, ..." en chaîne pipe-separated de pseudos valides.
+# Ex: "Cerisesss, Foo, BadName!" -> "Cerisesss|Foo".
+function mePseudoList(pseudos: text) :: text:
+    if {_pseudos} is not set:
+        return ""
+    set {_clean} to {_pseudos}
+    replace all "\r" with "" in {_clean}
+    replace all "\n" with "" in {_clean}
+    if {_clean} is "":
+        return ""
+    set {_out} to ""
+    loop split {_clean} at ",":
+        set {_cand} to loop-value
+        replace all " " with "" in {_cand}
+        replace all "\t" with "" in {_cand}
+        if {_cand} matches "^[a-zA-Z0-9_]{2,16}$":
+            if {_out} is "":
+                set {_out} to {_cand}
+            else:
+                set {_out} to "%{_out}%|%{_cand}%"
+    return {_out}
+
+# Construit l'item head (slot 4 du menu historique) avec skin appliquee.
+# name = pseudo Minecraft valide ; si vide -> tete Steve generique.
+function meBuildPersonHead(disp: text, page: integer, total: integer, ip: text, pseudo: text, ec: integer, name: text) :: item:
+    if {_name} is not "":
+        set {_off} to {_name} parsed as offline player
+        if {_off} is set:
+            set {_h} to skull of {_off}
+            set name of {_h} to "&6&l%{_disp}% &7- Page %{_page}%/%{_total}%"
+            set lore of {_h} to "&7IP : &b%{_ip}%" and "&7Pseudo(s) : &f%{_pseudo}%" and "&7Evenements : &f%{_ec}%"
+            return {_h}
+    set {_h} to a player head named "&6&l%{_disp}% &7- Page %{_page}%/%{_total}%"
+    set lore of {_h} to "&7IP : &b%{_ip}%" and "&7Pseudo(s) : &f%{_pseudo}%" and "&7Evenements : &f%{_ec}%"
+    return {_h}
+
+# Construit l'item slot 24 du menu à partir du cache.
+function meBuildDlItem() :: item:
+    if {me_dl::count} is not set:
+        set {_eye} to an ender eye named "&7Telechargements actifs : &f0"
+        set lore of {_eye} to "&7Aucun telechargement en cours." and "" and "&8URL : norath.fr/download/survie/latest"
+        return {_eye}
+    if {me_dl::count} <= 0:
+        set {_eye} to an ender eye named "&7Telechargements actifs : &f0"
+        set lore of {_eye} to "&7Aucun telechargement en cours." and "" and "&8URL : norath.fr/download/survie/latest"
+        return {_eye}
+    set {_eye} to an ender eye named "&e&lTelechargements actifs : &f%{me_dl::count}%"
+    set lore of {_eye} to "&8URL : norath.fr/download/survie/latest" and ""
+    loop {me_dl::lines::*}:
+        add "&7• &f%loop-value%" to lore of {_eye}
+    return {_eye}
+
+# Traduit une phase bash en texte affichable
+function mePhaseDisplay(v: text) :: text:
+    if {_v} is "starting":
+        return "Demarrage..."
+    if {_v} is "save_off":
+        return "Suspension saves"
+    if {_v} is "zipping":
+        return "Compression"
+    if {_v} is "verifying":
+        return "Verification"
+    if {_v} is "finalizing":
+        return "Finalisation"
+    if {_v} is "done":
+        return "Termine"
+    if {_v} is "cancelled":
+        return "Annule"
+    if {_v} is "failed":
+        return "Echec !"
+    return "Inactif"
+
+# Cycle "monthly -> weekly -> daily -> disabled -> monthly"
+function meCycleFreq(cur: text) :: text:
+    if {_cur} is "monthly":
+        return "weekly"
+    if {_cur} is "weekly":
+        return "daily"
+    if {_cur} is "daily":
+        return "disabled"
+    return "monthly"
+
+function meFreqDisplay(v: text) :: text:
+    if {_v} is "monthly":
+        return "&aMensuelle"
+    if {_v} is "weekly":
+        return "&aHebdomadaire"
+    if {_v} is "daily":
+        return "&aQuotidienne"
+    if {_v} is "disabled":
+        return "&cDesactivee"
+    return "&7?"
+
+# Ecrit une ligne dans le fichier d'historique DL (safe : remplace ' par rien)
+function meAppendDlLog(line: text):
+    set {_safe} to {_line}
+    replace all "'" with "" in {_safe}
+    meRunShell("echo '%{_safe}%' >> '{@me_dl_log}'")
+
+# ------------------------------------------------------------------------------
+#  Helpers de rendu du menu DL (utilises par meBuildDlMenu + refresh live 1s)
+# ------------------------------------------------------------------------------
+
+# Rend la rangee des DL actifs (slots 9-17) dans {_inv}.
+# Tres bon marche : aucun shell, lit uniquement les variables cache.
+function meRenderActiveDlRow(p: player, inv: inventory):
+    set {_cnt} to 0
+    if {me_dl::count} is set:
+        set {_cnt} to {me_dl::count}
+    set {_slot} to 9
+    if {_cnt} > 0:
+        set {_dl_idx} to 1
+        loop {me_dl::ids::*}:
+            if {_slot} > 17:
+                stop loop
+            set {_id} to loop-value
+            set {_ip_raw} to {me_dl::known::%{_id}%::ip}
+            if {_ip_raw} is not set:
+                set {_ip_raw} to "?"
+            set {_pseudo} to {me_dl::known::%{_id}%::pseudos}
+            set {_display} to {_ip_raw}
+            if {_pseudo} is set:
+                if {_pseudo} is not "":
+                    set {_display} to {_pseudo}
+            set {_lineval} to {me_dl::lines::%{_dl_idx}%}
+            if {_lineval} is not set:
+                set {_lineval} to "&7(donnees en cours de chargement)"
+            set {_isPaused} to false
+            if {me_dl::active_paused::%{_id}%} is "1":
+                set {_isPaused} to true
+
+            # Selection de l'item : tete du pseudo si disponible (cycle 2s
+            # entre les pseudos quand plusieurs sont associes a l'IP).
+            set {_pl} to mePseudoList({_pseudo} ? "")
+            set {_item} to false
+            if {_pl} is not "":
+                set {_pln::*} to split {_pl} at "|"
+                set {_pncount} to size of {_pln::*}
+                if {_pncount} >= 1:
+                    set {_now_ts} to unix timestamp of now
+                    set {_half} to floor({_now_ts} / 2)
+                    set {_cidx} to mod({_half}, {_pncount}) + 1
+                    set {_skname} to {_pln::%{_cidx}%}
+                    set {_off} to {_skname} parsed as offline player
+                    if {_off} is set:
+                        set {_item} to skull of {_off}
+                        if {_isPaused} is true:
+                            set name of {_item} to "&6&l⏸ #%{_id}% &7- &f%{_display}%"
+                        else:
+                            set name of {_item} to "&e#%{_id}% &7- &a%{_display}%"
+            if {_item} is false:
+                if {_isPaused} is true:
+                    set {_item} to an orange dye named "&6&l⏸ #%{_id}% &7- &f%{_display}%"
+                else:
+                    set {_item} to an emerald named "&e#%{_id}% &7- &a%{_display}%"
+            add "&7IP : &b%{_ip_raw}%" to lore of {_item}
+            set {_file_raw} to {me_dl::active_file::%{_id}%}
+            if {_file_raw} is set:
+                if {_file_raw} is not "":
+                    add "&7Fichier : &f%{_file_raw}%" to lore of {_item}
+            if {_isPaused} is true:
+                add "&6&lEN PAUSE &7(aucun progres depuis 5s+)" to lore of {_item}
+            add "&7%{_lineval}%" to lore of {_item}
+            add "" to lore of {_item}
+            add "&eClic gauche : &fInterrompre ce telechargement" to lore of {_item}
+            add "&cClic droit : &fInterrompre + restreindre 24h" to lore of {_item}
+            set slot {_slot} of {_inv} to {_item}
+            add 1 to {_slot}
+            add 1 to {_dl_idx}
+    # Filler pour les slots restants (count a baisse / aucun DL)
+    loop integers from {_slot} to 17:
+        set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+# Rend le header (slot 4). "frozen" = true quand on est sur page > 1.
+function meRenderDlHeader(p: player, inv: inventory, page: integer, totalPages: integer, frozen: boolean):
+    set {_cnt} to 0
+    if {me_dl::count} is set:
+        set {_cnt} to {me_dl::count}
+    if {_cnt} > 0:
+        set {_h} to a lime stained glass pane named "&a&l%{_cnt}% telechargement(s) en cours &7- Page %{_page}%/%{_totalPages}%"
+    else:
+        set {_h} to a light gray stained glass pane named "&7Aucun telechargement en cours &7- Page %{_page}%/%{_totalPages}%"
+    if {_frozen} is true:
+        set lore of {_h} to "&8Donnees historiques figees (page > 1)" and "&8Revenez en page 1 pour le live."
+    else:
+        set lore of {_h} to "&7Mise a jour temps reel (~1s)." and "&7Voir le detail dans la rangee ci-dessous."
+    set slot 4 of {_inv} to {_h}
+
+# Construit le menu de suivi des telechargements (6 rangees = 54 slots).
+function meBuildDlMenu(p: player):
+    set {_uuid} to uuid of {_p}
+    # Garde : empeche le on inventory close de wipe les mappings pendant le replace
+    set {me_dl_replacing::%{_uuid}%} to true
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_dl_title}"
+    # Si on ouvre frais (pas deja viewer), reset a page 1
+    if {me_dl_menu_viewers::%{_uuid}%} is not set:
+        set {me_dl_menu_page::%{_uuid}%} to 1
+
+    set {_cnt} to 0
+    if {me_dl::count} is set:
+        set {_cnt} to {me_dl::count}
+
+    # --- Rangee 0 : indicateur de statut global ---
+    # Slot 4 : header (vert si actifs, gris sinon)
+    if {_cnt} > 0:
+        set {_hdr} to a lime stained glass pane named "&a&l%{_cnt}% telechargement(s) en cours"
+        set lore of {_hdr} to "&7Mise a jour automatique toutes les 2 secondes." and "&7Voir le detail dans la rangee ci-dessous."
+    else:
+        set {_hdr} to a light gray stained glass pane named "&7Aucun telechargement en cours"
+        set lore of {_hdr} to "&8L'historique des derniers acces est affiche plus bas." and "&8Mise a jour automatique."
+    set slot 4 of {_inv} to {_hdr}
+
+    # --- Rangee 1 (slots 9-17) : DL actifs ---
+    meRenderActiveDlRow({_p}, {_inv})
+
+    # --- Rangee 2 (slots 18-26) : separateur historique (vitres orange) ---
+    set {_sep} to an orange stained glass pane named "&6&lHistorique &7(par personne, plus recent en haut)"
+    loop integers from 18 to 26:
+        set slot loop-integer of {_inv} to {_sep}
+
+    # --- Rangees 3-4 (slots 27-44) : groupe par IP, plus recent en haut, pagine ---
+    # On lit la fin du log en ORDRE INVERSE (tac) pour que la 1ere occurrence
+    # de chaque IP soit son evenement le plus recent. Resultat : tri natif
+    # newest-first sans avoir a comparer les dates.
+    set {_history_raw} to meRunShell("tac '{@me_dl_log}' 2>/dev/null | head -500")
+    set {_persons_ips::*} to ""
+    delete {_persons_ips::*}
+    delete {_persons_count::*}
+    delete {_persons_last_date::*}
+    delete {_persons_last_action::*}
+    delete {_persons_pseudo::*}
+    delete {_persons_total::*}
+    delete {_persons_status::*}
+    delete {_persons_pct::*}
+    set {_pi} to 0
+    loop split {_history_raw} at newline:
+        set {_hline} to loop-value
+        replace all "\r" with "" in {_hline}
+        if {_hline} is not "":
+            set {_hparts::*} to split {_hline} at "|"
+            if {_hparts::4} is set:
+                set {_ipk} to {_hparts::4}
+                if {_persons_count::%{_ipk}%} is not set:
+                    set {_pi} to {_pi} + 1
+                    set {_persons_count::%{_ipk}%} to 0
+                    add {_ipk} to {_persons_ips::*}
+                    # 1ere occurrence en tac = evenement le plus recent pour cette IP
+                    set {_persons_last_date::%{_ipk}%} to {_hparts::1}
+                    set {_persons_last_action::%{_ipk}%} to {_hparts::2}
+                    set {_persons_total::%{_ipk}%} to {_hparts::5}
+                    if {_hparts::6} is set:
+                        if {_hparts::6} is not "":
+                            set {_persons_pseudo::%{_ipk}%} to {_hparts::6}
+                    # Status enrichi (8e champ si present)
+                    if {_hparts::7} is set:
+                        set {_persons_status::%{_ipk}%} to {_hparts::7}
+                    if {_hparts::8} is set:
+                        set {_persons_pct::%{_ipk}%} to {_hparts::8}
+                set {_persons_count::%{_ipk}%} to {_persons_count::%{_ipk}%} + 1
+
+    set {_n} to size of {_persons_ips::*}
+    if {_n} is not set:
+        set {_n} to 0
+    set {_per_page} to 18
+    set {_total_pages} to ceil({_n} / {_per_page})
+    if {_total_pages} < 1:
+        set {_total_pages} to 1
+    set {_uuid} to uuid of {_p}
+    set {_page} to {me_dl_menu_page::%{_uuid}%}
+    if {_page} is not set:
+        set {_page} to 1
+    if {_page} > {_total_pages}:
+        set {_page} to {_total_pages}
+    if {_page} < 1:
+        set {_page} to 1
+    set {me_dl_menu_page::%{_uuid}%} to {_page}
+    # Cache le nombre de pages pour les refresh live (pas besoin de recalculer)
+    set {me_dl_menu_total_pages::%{_uuid}%} to {_total_pages}
+
+    set {_offset} to ({_page} - 1) * {_per_page}
+    set {_hslot} to 27
+    delete {me_dl_menu_slotip::%{_uuid}%::*}
+    delete {me_dl_menu_slot_pl::%{_uuid}%::*}
+    loop {_per_page} times:
+        if {_hslot} > 44:
+            stop loop
+        set {_idx} to {_offset} + loop-value
+        if {_idx} > {_n}:
+            stop loop
+        set {_ipk} to {_persons_ips::%{_idx}%}
+        if {_ipk} is set:
+            set {_pname} to {_persons_pseudo::%{_ipk}%}
+            set {_pdisp} to {_ipk}
+            if {_pname} is set:
+                if {_pname} is not "":
+                    set {_pdisp} to {_pname}
+            set {_pc} to {_persons_count::%{_ipk}%}
+            set {_pld} to {_persons_last_date::%{_ipk}%}
+            set {_pla} to {_persons_last_action::%{_ipk}%}
+            set {_plt} to {_persons_total::%{_ipk}%}
+            set {_pst} to {_persons_status::%{_ipk}%}
+            set {_ppct} to {_persons_pct::%{_ipk}%}
+            # Determine s'il y a un DL actif pour cette IP
+            set {_isactive} to false
+            loop {me_dl::ids::*}:
+                set {_aid} to loop-value-2
+                if {me_dl::known::%{_aid}%::ip} is {_ipk}:
+                    set {_isactive} to true
+
+            # --- Construction de l'item : tete du joueur si pseudo connu ---
+            # Cycle 2s entre les pseudos quand plusieurs sont associes a l'IP.
+            set {_pitem} to false
+            set {_pl_norm} to mePseudoList({_pname} ? "")
+            if {_pl_norm} is not "":
+                set {_pln2::*} to split {_pl_norm} at "|"
+                set {_pncount2} to size of {_pln2::*}
+                if {_pncount2} >= 1:
+                    set {_now_ts2} to unix timestamp of now
+                    set {_half2} to floor({_now_ts2} / 2)
+                    set {_cidx2} to mod({_half2}, {_pncount2}) + 1
+                    set {_skn} to {_pln2::%{_cidx2}%}
+                    set {_off2} to {_skn} parsed as offline player
+                    if {_off2} is set:
+                        set {_pitem} to skull of {_off2}
+                        set name of {_pitem} to "&f&l%{_pdisp}%"
+            if {_pitem} is false:
+                set {_pitem} to a player head named "&f&l%{_pdisp}%"
+
+            # Determine ligne de statut + couleur du label dans le lore
+            if {_isactive} is true:
+                set name of {_pitem} to "&a&l%{_pdisp}% &7(en cours)"
+                set {_statline} to "&aStatut : &fEN COURS &8(%{_pld}%)"
+            else if {_pla} is "start":
+                set {_statline} to "&eStatut : &fDebut sans fin connue &8- %{_pld}%"
+            else if {_pst} is "done":
+                set {_statline} to "&aStatut : &fComplet a 100%% &8- %{_pld}%"
+            else if {_pst} is "cancel_user":
+                set {_statline} to "&cStatut : &fAnnule par l'utilisateur a %{_ppct}%%% &8- %{_pld}%"
+            else if {_pst} is "cancel_admin":
+                set {_statline} to "&4Statut : &fCoupe par l'admin a %{_ppct}%%% &8- %{_pld}%"
+            else if {_pst} is "cancel_disabled":
+                set {_statline} to "&8Statut : &fDL desactive serveur a %{_ppct}%%% &8- %{_pld}%"
+            else if {_pst} is "error":
+                set {_statline} to "&5Statut : &fErreur serveur a %{_ppct}%%% &8- %{_pld}%"
+            else:
+                set {_statline} to "&7Dernier : &f%{_pld}%"
+
+            set lore of {_pitem} to "&7IP : &b%{_ipk}%" and "&7Evenements : &f%{_pc}%" and {_statline} and "&7Taille : &f%{_plt}%" and "" and "&eClic gauche : &fouvrir la fiche detaillee"
+            set slot {_hslot} of {_inv} to {_pitem}
+            set {me_dl_menu_slotip::%{_uuid}%::%{_hslot}%} to {_ipk}
+            # Cache pour le cycle de skin (every 2s) si plusieurs pseudos
+            if {_pl_norm} is not "":
+                set {me_dl_menu_slot_pl::%{_uuid}%::%{_hslot}%} to {_pl_norm}
+            set {_hslot} to {_hslot} + 1
+
+    # Header avec pagination (via helper, coherent avec live update)
+    meRenderDlHeader({_p}, {_inv}, {_page}, {_total_pages}, false)
+
+    # --- Rangee 5 (slots 45-53) : nav + retour ---
+    set {_back} to a barrier named "&cRetour"
+    set lore of {_back} to "&7Revenir au menu principal."
+    set slot 49 of {_inv} to {_back}
+    if {_page} > 1:
+        set {_prev} to an arrow named "&ePage precedente"
+        set lore of {_prev} to "&7Aller a la page %{_page} - 1%/%{_total_pages}%."
+        set slot 45 of {_inv} to {_prev}
+    if {_page} < {_total_pages}:
+        set {_next} to an arrow named "&ePage suivante"
+        set lore of {_next} to "&7Aller a la page %{_page} + 1%/%{_total_pages}%."
+        set slot 53 of {_inv} to {_next}
+
+    # Remplissage decoratif (vitres grises) pour tous les slots vides
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    open {_inv} to {_p}
+    set {me_dl_menu_viewers::%uuid of {_p}%} to true
+    # Releve la garde apres open (le close event du precedent inv a deja fire)
+    delete {me_dl_replacing::%uuid of {_p}%}
+
+# Vue détaillée d'une personne (tous ses événements) — pagine, plus recent en haut
+
+# Rafraichit le cache des IP restreintes depuis l'API norath-web.
+# Stocke un set {me_restricted::set::<ip>} = true.
+function meRefreshRestrictedSet():
+    delete {me_restricted::set::*}
+    set {_out} to meRunShell("curl -s --max-time 2 'http://localhost:8080/api/dl-restricted?fmt=pipe' 2>/dev/null")
+    replace all newline with "" in {_out}
+    if {_out} is "":
+        stop
+    set {_p::*} to split {_out} at "|"
+    set {_n} to ({_p::1} ? "0") parsed as integer
+    if {_n} is not set:
+        stop
+    if {_n} <= 0:
+        stop
+    loop {_n} times:
+        set {_idx} to loop-value + 1
+        set {_entry} to {_p::%{_idx}%}
+        if {_entry} is set:
+            set {_t::*} to split {_entry} at "~"
+            set {_ip} to {_t::1}
+            if {_ip} is set:
+                if {_ip} is not "":
+                    set {me_restricted::set::%{_ip}%} to true
+
+# Met a jour les slots dynamiques du menu Personne (status DL + boutons).
+# Doit etre appele depuis meBuildPersonMenu et depuis le tick every 2s.
+function meRefreshPersonLiveSlots(p: player, inv: inventory, ip: text):
+    set {_uuid} to uuid of {_p}
+    # 1) Detection DL actif pour cette IP
+    set {_active_id} to ""
+    loop {me_dl::ids::*}:
+        if {me_dl::known::%loop-value%::ip} is {_ip}:
+            set {_active_id} to loop-value
+    delete {me_person_active_id::%{_uuid}%}
+    if {_active_id} is not "":
+        set {me_person_active_id::%{_uuid}%} to {_active_id}
+        set {_pct_a} to {me_dl::active_pct::%{_active_id}%} ? "?"
+        set {_done_a} to {me_dl::active_done::%{_active_id}%} ? "?"
+        set {_total_a} to {me_dl::active_total::%{_active_id}%} ? "?"
+        set {_eta_a} to {me_dl::active_eta::%{_active_id}%} ? "?"
+        set {_speed_a} to {me_dl::active_speed::%{_active_id}%} ? "?"
+        set {_elap_a} to {me_dl::active_elapsed::%{_active_id}%} ? "?"
+        set {_paus_a} to {me_dl::active_paused::%{_active_id}%} ? "0"
+        set {_file_a} to {me_dl::active_file::%{_active_id}%} ? ""
+        set {_file_line_a} to ""
+        if {_file_a} is not "":
+            set {_file_line_a} to "&7Fichier : &f%{_file_a}%"
+        if {_paus_a} is "1":
+            set {_status_act} to a clock named "&6&lTelechargement en PAUSE"
+            set lore of {_status_act} to "&7Progression : &f%{_pct_a}%%% &8(%{_done_a}%/%{_total_a}%)" and "&7Temps ecoule : &f%{_elap_a}%" and "&7Debit : &b%{_speed_a}%" and "&7ETA : &e%{_eta_a}%" and {_file_line_a} and "" and "&6Aucun chunk recu depuis 5s+" and "&8Rafraichissement automatique toutes les 2s."
+        else:
+            set {_status_act} to an emerald named "&a&lTelechargement en cours"
+            set lore of {_status_act} to "&7Progression : &a%{_pct_a}%%% &8(%{_done_a}%/%{_total_a}%)" and "&7Temps ecoule : &f%{_elap_a}%" and "&7Debit : &b%{_speed_a}%" and "&7Temps restant : &e%{_eta_a}%" and {_file_line_a} and "" and "&8Rafraichissement automatique toutes les 2s."
+        set slot 11 of {_inv} to {_status_act}
+
+        set {_kill_btn} to a barrier named "&c&lInterrompre le DL"
+        set lore of {_kill_btn} to "&7Coupe ce telechargement immediatement." and "&7Le client recoit une erreur HTTP." and "" and "&eClic gauche : &finterrompre"
+        set slot 13 of {_inv} to {_kill_btn}
+    else:
+        set {_status_act} to a gray dye named "&7&lAucun DL en cours"
+        set lore of {_status_act} to "&7Cette personne ne telecharge pas" and "&7actuellement." and "" and "&8Rafraichissement automatique toutes les 2s."
+        set slot 11 of {_inv} to {_status_act}
+
+        set {_kill_btn} to a black stained glass pane named "&8Interrompre"
+        set lore of {_kill_btn} to "&8(Aucun DL actif a interrompre)"
+        set slot 13 of {_inv} to {_kill_btn}
+
+    # 2) Bouton restriction / leve de restriction
+    if {me_restricted::set::%{_ip}%} is set:
+        set {_restrict_btn} to a lime dye named "&a&lLever la restriction"
+        set lore of {_restrict_btn} to "&7L'IP &b%{_ip}% &7est actuellement restreinte." and "&7Aucun DL n'est possible depuis cette IP." and "" and "&eClic gauche : &flever la restriction"
+    else:
+        set {_restrict_btn} to a redstone block named "&4&lRestreindre 24h"
+        set lore of {_restrict_btn} to "&7Bloque tout DL depuis &b%{_ip}%" and "&7pendant 24 heures." and "&7N'agit pas sur les pseudos eventuels." and "" and "&eClic gauche : &fappliquer la restriction"
+    set slot 15 of {_inv} to {_restrict_btn}
+
+# Rafraichit les slots evenements (18-44), la navigation (45/53) et le header
+# (slot 4) du menu Personne. Detecte les changements via signature pour eviter
+# tout flicker quand rien de nouveau n'est arrive. Doit etre appele depuis
+# meBuildPersonMenu (premiere construction) et depuis le tick every 2s.
+function meRefreshPersonEvents(p: player, inv: inventory, ip: text):
+    set {_uuid} to uuid of {_p}
+    set {_safe_ip} to {_ip}
+    replace all "'" with "" in {_safe_ip}
+    set {_raw} to meRunShell("grep -F '|%{_safe_ip}%|' '{@me_dl_log}' 2>/dev/null | tac | head -500")
+    delete {_ev::*}
+    set {_ec} to 0
+    loop split {_raw} at newline:
+        set {_eline} to loop-value
+        replace all "\r" with "" in {_eline}
+        if {_eline} is not "":
+            set {_ec} to {_ec} + 1
+            set {_ev::%{_ec}%} to {_eline}
+    # Signature = nb d'events + 1ere ligne (la plus recente). Change si un
+    # nouvel event apparait, ou si la liste a ete tronquee/modifiee.
+    set {_top} to {_ev::1} ? ""
+    set {_sig} to "%{_ec}%::%{_top}%::%{me_person_menu_page::%{_uuid}%} ? 1%"
+    set {_prevsig} to metadata value "me_person_ev_sig" of {_p}
+    if {_prevsig} is {_sig}:
+        # Rien de neuf, on sort sans toucher a l'inventaire.
+        stop
+    set metadata value "me_person_ev_sig" of {_p} to {_sig}
+
+    set {_per_page} to 27
+    set {_total_pages} to ceil({_ec} / {_per_page})
+    if {_total_pages} < 1:
+        set {_total_pages} to 1
+    set {_page} to {me_person_menu_page::%{_uuid}%}
+    if {_page} is not set:
+        set {_page} to 1
+    if {_page} > {_total_pages}:
+        set {_page} to {_total_pages}
+    if {_page} < 1:
+        set {_page} to 1
+    set {me_person_menu_page::%{_uuid}%} to {_page}
+    set metadata value "me_person_ec" of {_p} to {_ec}
+    set metadata value "me_person_page" of {_p} to {_page}
+    set metadata value "me_person_total" of {_p} to {_total_pages}
+
+    # On efface la zone events + nav avant le rebuild.
+    loop integers from 18 to 44:
+        set slot loop-integer of {_inv} to air
+    set slot 45 of {_inv} to air
+    set slot 53 of {_inv} to air
+
+    set {_offset} to ({_page} - 1) * {_per_page}
+    set {_eslot} to 18
+    loop {_per_page} times:
+        if {_eslot} > 44:
+            stop loop
+        set {_idx} to {_offset} + loop-value
+        if {_idx} > {_ec}:
+            stop loop
+        set {_eline} to {_ev::%{_idx}%}
+        set {_eparts::*} to split {_eline} at "|"
+        if {_eparts::1} is set:
+            set {_edate} to {_eparts::1}
+            set {_eaction} to {_eparts::2}
+            set {_eid} to {_eparts::3}
+            set {_etotal} to {_eparts::5}
+            set {_estatus} to {_eparts::7}
+            set {_epct} to {_eparts::8}
+            set {_edone_h} to {_eparts::9}
+            # Fichier : col 7 pour start, col 10 pour end (back-compat : peut etre absent)
+            set {_efile} to ""
+            if {_eaction} is "start":
+                if {_eparts::7} is set:
+                    set {_efile} to {_eparts::7}
+            else if {_eaction} is "end":
+                if {_eparts::10} is set:
+                    set {_efile} to {_eparts::10}
+            set {_eprogress} to ""
+            if {_edone_h} is set:
+                if {_edone_h} is not "":
+                    if {_edone_h} is not "?":
+                        set {_eprogress} to "&7Progression : &f%{_edone_h}%&7/&f%{_etotal}%"
+            if {_eaction} is "start":
+                set {_eitem} to a lime dye named "&a▶ Debut DL &7- &f%{_edate}%"
+                set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "" and "&8Action : start"
+            else if {_eaction} is "end":
+                if {_estatus} is "done":
+                    set {_eitem} to an experience bottle named "&a✔ Termine &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "&aComplet a 100%%" and "" and "&8Action : end / done"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "&aComplet a 100%%" and "" and "&8Action : end / done"
+                else if {_estatus} is "cancel_user":
+                    set {_eitem} to a red dye named "&c✖ Annule (user) &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "&cAtteint %{_epct}%%% avant annulation" and "" and "&8Action : end / cancel_user"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "&cAtteint %{_epct}%%% avant annulation" and "" and "&8Action : end / cancel_user"
+                else if {_estatus} is "cancel_admin":
+                    set {_eitem} to a barrier named "&4⛔ Coupe (admin) &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "&4Atteint %{_epct}%%% avant coupure" and "" and "&8Action : end / cancel_admin"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "&4Atteint %{_epct}%%% avant coupure" and "" and "&8Action : end / cancel_admin"
+                else if {_estatus} is "cancel_disabled":
+                    set {_eitem} to a coal named "&8⚠ DL desactive &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "&8Atteint %{_epct}%%% avant coupure globale" and "" and "&8Action : end / cancel_disabled"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "&8Atteint %{_epct}%%% avant coupure globale" and "" and "&8Action : end / cancel_disabled"
+                else if {_estatus} is "error":
+                    set {_eitem} to a wither rose named "&5☠ Erreur &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "&5Echec serveur a %{_epct}%%%" and "" and "&8Action : end / error"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "&5Echec serveur a %{_epct}%%%" and "" and "&8Action : end / error"
+                else:
+                    set {_eitem} to a red dye named "&c■ Fin DL &7- &f%{_edate}%"
+                    if {_eprogress} is not "":
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and {_eprogress} and "" and "&8Action : end (statut inconnu, log ancien)"
+                    else:
+                        set lore of {_eitem} to "&7id : &f#%{_eid}%" and "&7Taille : &f%{_etotal}%" and "" and "&8Action : end (statut inconnu, log ancien)"
+            else:
+                set {_eitem} to a paper named "&7%{_eaction}% &7- &f%{_edate}%"
+                set lore of {_eitem} to "&7id : &f#%{_eid}%"
+            if {_efile} is not "":
+                add "&7Fichier : &f%{_efile}%" to lore of {_eitem}
+            set slot {_eslot} of {_inv} to {_eitem}
+            set {_eslot} to {_eslot} + 1
+
+    if {_page} > 1:
+        set {_prev} to an arrow named "&ePage precedente"
+        set lore of {_prev} to "&7Aller a la page %{_page} - 1%/%{_total_pages}%."
+        set slot 45 of {_inv} to {_prev}
+    if {_page} < {_total_pages}:
+        set {_next} to an arrow named "&ePage suivante"
+        set lore of {_next} to "&7Aller a la page %{_page} + 1%/%{_total_pages}%."
+        set slot 53 of {_inv} to {_next}
+
+    # Filler pour les emplacements events restes vides + nav vide.
+    loop integers from 18 to 44:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+    if slot 45 of {_inv} is air:
+        set slot 45 of {_inv} to a gray stained glass pane named " "
+    if slot 53 of {_inv} is air:
+        set slot 53 of {_inv} to a gray stained glass pane named " "
+
+    # Met a jour le header (slot 4) avec le nouveau compteur d'events.
+    set {_disp} to (metadata value "me_person_disp" of {_p}) ? {_ip}
+    set {_pseudo} to (metadata value "me_person_pseudo" of {_p}) ? ""
+    set {_skin_idx} to {me_person_skin_idx::%{_uuid}%} ? 1
+    set {_first_name} to {me_person_skins::%{_uuid}%::%{_skin_idx}%} ? ""
+    set slot 4 of {_inv} to meBuildPersonHead({_disp}, {_page}, {_total_pages}, {_ip}, {_pseudo}, {_ec}, {_first_name})
+
+function meBuildPersonMenu(p: player, ip: text):
+    set {_uuid} to uuid of {_p}
+    set {me_person_replacing::%{_uuid}%} to true
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_person_title}"
+    # Si on ouvre frais (pas deja viewer) ou si l'IP change, reset a page 1
+    if {me_person_menu_viewers::%{_uuid}%} is not set:
+        set {me_person_menu_page::%{_uuid}%} to 1
+    else if {me_person_menu_ip::%{_uuid}%} is not {_ip}:
+        set {me_person_menu_page::%{_uuid}%} to 1
+    set {me_person_menu_ip::%{_uuid}%} to {_ip}
+
+    set {_pseudo} to meResolvePseudos({_ip})
+    set {_disp} to {_ip}
+    if {_pseudo} is not "":
+        set {_disp} to {_pseudo}
+
+    # Skins pour cycle du header (slot 4) toutes les 2s
+    set {_pseudo_list} to mePseudoList({_pseudo})
+    delete {me_person_skins::%{_uuid}%::*}
+    set {_si} to 0
+    if {_pseudo_list} is not "":
+        loop split {_pseudo_list} at "|":
+            set {_si} to {_si} + 1
+            set {me_person_skins::%{_uuid}%::%{_si}%} to loop-value
+    set {me_person_skins_count::%{_uuid}%} to {_si}
+    set {me_person_skin_idx::%{_uuid}%} to 1
+
+    # Refs metadata (necessaires AVANT meRefreshPersonEvents qui les lit pour le header)
+    set metadata value "me_person_inv" of {_p} to {_inv}
+    set metadata value "me_person_disp" of {_p} to {_disp}
+    set metadata value "me_person_pseudo" of {_p} to {_pseudo}
+    set metadata value "me_person_ip" of {_p} to {_ip}
+    # Force le 1er rendu des events (sinon la signature pourrait correspondre a un ancien menu)
+    delete metadata value "me_person_ev_sig" of {_p}
+
+    # --- Rangee actions (slots 9-17) -----------------------------------------
+    meRefreshRestrictedSet()
+    meRefreshPersonLiveSlots({_p}, {_inv}, {_ip})
+    # Slots 9, 10, 12, 14, 16, 17 : separateur visuel
+    loop integers from 9 to 17:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    # --- Header (slot 4) + events (18-44) + nav (45/53) ----------------------
+    meRefreshPersonEvents({_p}, {_inv}, {_ip})
+
+    # Slot 49 : retour
+    set slot 49 of {_inv} to a barrier named "&cRetour vue telechargements"
+
+    # Filler global
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    open {_inv} to {_p}
+    set {me_person_menu_viewers::%uuid of {_p}%} to true
+    delete {me_person_replacing::%uuid of {_p}%}
+
+# ==============================================================================
+#  Watcher save-off / save-on
+# ==============================================================================
+
+every 3 seconds:
+    if meFileExists("{@me_save_off_req}") is true:
+        meDeleteFile("{@me_save_off_req}")
+        send "&6[Map] &eExport lance. Sauvegardes suspendues." to console
+        execute console command "save-all flush"
+        wait 2 seconds
+        execute console command "save-off"
+        wait 1 second
+        # Assure que level.dat est lisible par debian apres le save (Paper ecrit en mode 600)
+        meRunShell("chmod o+r '{@me_scripts_dir}/../sv/level.dat' '{@me_scripts_dir}/../sv/level.dat_old' 2>/dev/null || true")
+        meTouchFile("{@me_save_off_done}")
+    if meFileExists("{@me_save_on_req}") is true:
+        meDeleteFile("{@me_save_on_req}")
+        execute console command "save-on"
+        execute console command "save-all"
+        send "&6[Map] &aExport termine. Sauvegardes reactivees." to console
+
+# ==============================================================================
+#  Poller téléchargements actifs (cache + détection nouveaux DL + log console)
+# ==============================================================================
+
+every 1 second:
+    # 1) Poll l'API Node.js (curl localhost = très rapide ~1ms)
+    set {_raw} to meRunShell("curl -s 'http://localhost:8080/api/dl-active?fmt=pipe' 2>/dev/null")
+    replace all newline with "" in {_raw}
+    if {_raw} is "":
+        # API indisponible : on garde le cache existant, on n'efface rien
+        stop
+
+    # 1b) (du -sb deplace dans une boucle separee every 30s pour ne pas spammer le disque)
+
+    set {_parts::*} to split {_raw} at "|"
+    set {_newver} to {_parts::1}
+    set {_newcount} to ({_parts::2}) parsed as integer
+    if {_newcount} is not set:
+        set {_newcount} to 0
+
+    # 2) Reconstruit le cache à partir de la réponse
+    set {_oldids::*} to {me_dl::ids::*}
+    delete {me_dl::ids::*}
+    delete {me_dl::lines::*}
+    set {me_dl::version} to {_newver}
+    set {me_dl::count} to {_newcount}
+
+    if {_newcount} > 0:
+        set {_i} to 3
+        loop {_newcount} times:
+            set {_line} to {_parts::%{_i}%}
+            set {_i} to {_i} + 1
+            if {_line} is set:
+                set {_f::*} to split {_line} at "~"
+                set {_id} to {_f::1}
+                set {_ip} to {_f::2}
+                set {_pct} to {_f::3}
+                set {_done} to {_f::4}
+                set {_total} to {_f::5}
+                set {_elapsed} to {_f::6}
+                set {_paused} to "0"
+                set {_speed} to "?"
+                set {_eta} to "?"
+                set {_file} to ""
+                if {_f::7} is set:
+                    set {_paused} to {_f::7}
+                if {_f::8} is set:
+                    set {_speed} to {_f::8}
+                if {_f::9} is set:
+                    set {_eta} to {_f::9}
+                if {_f::10} is set:
+                    set {_file} to {_f::10}
+                add {_id} to {me_dl::ids::*}
+                set {me_dl::active_paused::%{_id}%} to {_paused}
+                set {me_dl::active_pct::%{_id}%} to {_pct}
+                set {me_dl::active_done::%{_id}%} to {_done}
+                set {me_dl::active_total::%{_id}%} to {_total}
+                set {me_dl::active_elapsed::%{_id}%} to {_elapsed}
+                set {me_dl::active_speed::%{_id}%} to {_speed}
+                set {me_dl::active_eta::%{_id}%} to {_eta}
+                set {me_dl::active_file::%{_id}%} to {_file}
+                if {_paused} is "1":
+                    add "%{_ip}% &8— &6PAUSE &7(%{_done}%/%{_total}%) &8- &f%{_elapsed}% &8• &b%{_speed}% &8• &eETA %{_eta}%" to {me_dl::lines::*}
+                else:
+                    add "%{_ip}% &8— &a%{_pct}%%% &7(%{_done}%/%{_total}%) &8- &f%{_elapsed}% &8• &b%{_speed}% &8• &eETA %{_eta}%" to {me_dl::lines::*}
+
+                # 3) Détecter nouveaux DL → log console + résolution LiteBans
+                if {me_dl::seen::%{_id}%} is not set:
+                    set {me_dl::seen::%{_id}%} to true
+                    set {_pseudos} to meResolvePseudos({_ip})
+                    # Stocker les infos pour le log de fin et la vue DL
+                    set {me_dl::known::%{_id}%::ip} to {_ip}
+                    set {me_dl::known::%{_id}%::total} to {_total}
+                    set {me_dl::known::%{_id}%::pseudos} to {_pseudos}
+                    set {me_dl::known::%{_id}%::file} to {_file}
+                    # Log fichier : entrée start
+                    set {_logdate} to meRunShell("date '+%%d/%%m %%H:%%M'")
+                    replace all newline with "" in {_logdate}
+                    meAppendDlLog("%{_logdate}%|start|%{_id}%|%{_ip}%|%{_total}%|%{_pseudos}%|%{_file}%")
+                    if {_pseudos} is "":
+                        send "&6[Map] &eNouveau DL &7| &fid=&e%{_id}% &fip=&b%{_ip}% &fsize=&7%{_total}% &ffile=&f%{_file}% &8(aucun pseudo connu)" to console
+                    else:
+                        send "&6[Map] &eNouveau DL &7| &fid=&e%{_id}% &fip=&b%{_ip}% &fsize=&7%{_total}% &ffile=&f%{_file}% &8| &fpseudo(s): &a%{_pseudos}%" to console
+
+    # 4) Nettoyer le suivi 'seen' pour les ID qui ne sont plus actifs
+    #    On consulte /api/dl-recent pour connaître le vrai status de fin.
+    set {_recent_raw} to ""
+    loop {_oldids::*}:
+        if {me_dl::ids::*} does not contain loop-value:
+            if {_recent_raw} is "":
+                set {_recent_raw} to meRunShell("curl -s --max-time 2 'http://localhost:8080/api/dl-recent?fmt=pipe' 2>/dev/null")
+                replace all newline with "" in {_recent_raw}
+                # Construire un index id -> status~pct~elapsedMs
+                delete {_rmap::*}
+                if {_recent_raw} is not "":
+                    set {_rparts::*} to split {_recent_raw} at "|"
+                    set {_ri} to 2
+                    set {_rcount} to {_rparts::1} parsed as integer
+                    if {_rcount} is set:
+                        loop {_rcount} times:
+                            set {_rline} to {_rparts::%{_ri}%}
+                            set {_ri} to {_ri} + 1
+                            if {_rline} is set:
+                                set {_rf::*} to split {_rline} at "~"
+                                if {_rf::1} is set:
+                                    set {_rdone_h} to "?"
+                                    set {_rtotal_h} to "?"
+                                    set {_rfile} to ""
+                                    if {_rf::7} is set:
+                                        set {_rdone_h} to {_rf::7}
+                                    if {_rf::8} is set:
+                                        set {_rtotal_h} to {_rf::8}
+                                    if {_rf::9} is set:
+                                        set {_rfile} to {_rf::9}
+                                    set {_rmap::%{_rf::1}%} to "%{_rf::4}%~%{_rf::5}%~%{_rf::6}%~%{_rdone_h}%~%{_rtotal_h}%~%{_rfile}%"
+            # Log fichier : entrée end avec status réel
+            set {_eid} to loop-value
+            set {_eip} to {me_dl::known::%{_eid}%::ip}
+            set {_etotal} to {me_dl::known::%{_eid}%::total}
+            set {_epseudo} to {me_dl::known::%{_eid}%::pseudos}
+            set {_efile} to {me_dl::known::%{_eid}%::file}
+            if {_efile} is not set:
+                set {_efile} to ""
+            set {_estatus} to "unknown"
+            set {_epct} to "?"
+            set {_edone_h} to "?"
+            if {_rmap::%{_eid}%} is set:
+                set {_rdata::*} to split {_rmap::%{_eid}%} at "~"
+                set {_estatus} to {_rdata::1}
+                set {_epct} to {_rdata::2}
+                if {_rdata::4} is set:
+                    set {_edone_h} to {_rdata::4}
+                if {_rdata::5} is set:
+                    set {_etotal} to {_rdata::5}
+                if {_rdata::6} is set:
+                    if {_rdata::6} is not "":
+                        set {_efile} to {_rdata::6}
+            if {_eip} is set:
+                set {_logdate2} to meRunShell("date '+%%d/%%m %%H:%%M'")
+                replace all newline with "" in {_logdate2}
+                meAppendDlLog("%{_logdate2}%|end|%{_eid}%|%{_eip}%|%{_etotal}%|%{_epseudo}%|%{_estatus}%|%{_epct}%|%{_edone_h}%|%{_efile}%")
+                send "&6[Map] &eFin DL &7| &fid=&e%{_eid}% &fip=&b%{_eip}% &fstatus=&a%{_estatus}% &fpct=&7%{_epct}%%% &ffile=&f%{_efile}%" to console
+            delete {me_dl::known::%{_eid}%::ip}
+            delete {me_dl::known::%{_eid}%::total}
+            delete {me_dl::known::%{_eid}%::pseudos}
+            delete {me_dl::known::%{_eid}%::file}
+            delete {me_dl::seen::%loop-value%}
+            delete {me_dl::active_paused::%{_eid}%}
+            delete {me_dl::active_pct::%{_eid}%}
+            delete {me_dl::active_done::%{_eid}%}
+            delete {me_dl::active_total::%{_eid}%}
+            delete {me_dl::active_elapsed::%{_eid}%}
+            delete {me_dl::active_speed::%{_eid}%}
+            delete {me_dl::active_eta::%{_eid}%}
+            delete {me_dl::active_file::%{_eid}%}
+
+    # 5) Refresh le slot 24 pour les viewers du menu (+ slot 16 si phase change)
+    set {_cur_phase} to meReadProgress("phase")
+    set {_phase_changed} to false
+    if {me_export::phase_prev} is not {_cur_phase}:
+        set {_phase_changed} to true
+        set {me_export::phase_prev} to {_cur_phase}
+    loop all players:
+        if {me_menu_viewers::%uuid of loop-player%} is set:
+            if name of current inventory of loop-player is "{@me_gui_title}":
+                if {_phase_changed} is true:
+                    meBuildMenu(loop-player)
+                else:
+                    set slot 22 of current inventory of loop-player to meBuildDlItem()
+                    # Rafraichit aussi le bouton run/cancel (pct + ETA + barre)
+                    # tant qu'une phase active tourne, sinon il reste fige a 0%.
+                    if meIsActivePhase({_cur_phase}) is true:
+                        set slot 24 of current inventory of loop-player to meBuildRunItem({_cur_phase})
+            else:
+                delete {me_menu_viewers::%uuid of loop-player%}
+
+    # 6) Refresh le menu DL complet pour les viewers de la vue DL
+    #    Detecte les changements (version DL OU mtime du fichier historique)
+    set {_mt_raw} to meRunShell("stat -c %%Y '{@me_dl_log}' 2>/dev/null")
+    replace all newline with "" in {_mt_raw}
+    set {_mt} to {_mt_raw} parsed as integer
+    set {_changed} to false
+    if {me_dl::version_prev} is not {me_dl::version}:
+        set {_changed} to true
+        set {me_dl::version_prev} to {me_dl::version}
+    if {_mt} is set:
+        if {me_dl::history_mtime_prev} is not {_mt}:
+            set {_changed} to true
+            set {me_dl::history_mtime_prev} to {_mt}
+    loop all players:
+        if {me_dl_menu_viewers::%uuid of loop-player%} is set:
+            if name of current inventory of loop-player is "{@me_gui_dl_title}":
+                set {_vpage} to {me_dl_menu_page::%uuid of loop-player%}
+                if {_vpage} is not set:
+                    set {_vpage} to 1
+                set {_vtp} to {me_dl_menu_total_pages::%uuid of loop-player%}
+                if {_vtp} is not set:
+                    set {_vtp} to 1
+                if {_changed} is true:
+                    if {_vpage} is 1:
+                        # Rebuild complet (la grille historique a change)
+                        meBuildDlMenu(loop-player)
+                    else:
+                        # Page > 1 : on garde la grille figee, on met a jour
+                        # uniquement la rangee active + header
+                        meRenderActiveDlRow(loop-player, current inventory of loop-player)
+                        meRenderDlHeader(loop-player, current inventory of loop-player, {_vpage}, {_vtp}, true)
+                else:
+                    # Pas de changement de version : live update rangee + header
+                    meRenderActiveDlRow(loop-player, current inventory of loop-player)
+                    set {_isfrozen} to true
+                    if {_vpage} is 1:
+                        set {_isfrozen} to false
+                    meRenderDlHeader(loop-player, current inventory of loop-player, {_vpage}, {_vtp}, {_isfrozen})
+            else:
+                delete {me_dl_menu_viewers::%uuid of loop-player%}
+
+# Cache taille dossier telechargements (lent : du -sb sur tout le dossier).
+# Pas besoin d'etre temps reel : refresh toutes les 30s.
+every 30 seconds:
+    set {_du_raw} to meRunShell("du -sb /srv/xeinoria-downloads/survie/ 2>/dev/null | awk '{print $1}'")
+    replace all newline with "" in {_du_raw}
+    if {_du_raw} is not "":
+        set {me_dl::used_bytes} to {_du_raw} parsed as number
+
+# ==============================================================================
+#  Barre de progression action bar (joueur declencheur)
+# ==============================================================================
+
+every 1 second:
+    if {me_export_player} is not set:
+        stop
+    if {me_export_player} is not online:
+        delete {me_export_player}
+        stop
+    set {_phase} to meReadProgress("phase")
+    if meIsActivePhase({_phase}) is true:
+        set {_pct_s} to meReadProgress("pct")
+        set {_pct} to {_pct_s} parsed as integer
+        if {_pct} is not set:
+            set {_pct} to 0
+        set {_eta_s} to meReadProgress("eta_seconds")
+        set {_eta} to {_eta_s} parsed as integer
+        if {_eta} is not set:
+            set {_eta} to 0
+        set {_bar} to meProgressBar({_pct})
+        set {_phase_fr} to mePhaseDisplay({_phase})
+        send action bar "&6[Map] &f%{_pct}%%% %{_bar}% &7%{_phase_fr}% &8| ETA %meEtaDisplay({_eta})%" to {me_export_player}
+    else if {_phase} is "done":
+        send action bar "&a[Map] &a✔ Export termine ! &f100%% &a%meProgressBar(100)%" to {me_export_player}
+        delete {me_export_player}
+    else if {_phase} is "cancelled":
+        send action bar "&c[Map] &c✘ Export annule." to {me_export_player}
+        delete {me_export_player}
+    else if {_phase} is "failed":
+        send action bar "&c[Map] &c✘ Export ECHOUE ! /mapexport status" to {me_export_player}
+        delete {me_export_player}
+
+# ==============================================================================
+#  Lancement d'un export en arriere-plan
+# ==============================================================================
+
+function meTriggerExport() :: text:
+    set {_logfile} to "{@me_scripts_dir}/export_map.log"
+    # Passe le nom du joueur declencheur au script (stocke dans progress file)
+    set {_player_arg} to ""
+    if {me_export_player} is set:
+        if {me_export_player} is online:
+            set {_player_arg} to name of {me_export_player}
+    # Verifier l'espace disque avant de lancer
+    set {_free_raw} to meStatusValue("free_bytes")
+    set {_free_b} to {_free_raw} parsed as number
+    if {_free_b} is set:
+        if {_free_b} < 10737418240:
+            set {_fgb} to floor({_free_b} / 1073741824)
+            return "&cEspace libre insuffisant (%{_fgb}% GB libre, minimum 10 GB requis)."
+    set {_max_gb} to meDlCfgGet("max_gb") parsed as integer
+    if {_max_gb} is not set:
+        set {_max_gb} to 50
+    if {me_dl::used_bytes} is set:
+        set {_used_gb} to floor({me_dl::used_bytes} / 1073741824)
+        if {_used_gb} >= {_max_gb}:
+            return "&cQuota atteint : %{_used_gb}% GB utilises sur %{_max_gb}% GB max."
+    set {_cmd} to "nohup {@me_script} run %{_player_arg}% >> %{_logfile}% 2>&1 < /dev/null &"
+    meRunShell({_cmd})
+    return "Export lance (voir %{_logfile}%)."
+
+# ==============================================================================
+#  GUI : page paramètres avancés (VPN / ban / captcha)
+# ==============================================================================
+
+function meBuildSettingsMenu(p: player):
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_settings_title}"
+
+    # Lecture config JSON
+    set {_blockvpn} to meDlCfgGet("block_vpn")
+    set {_blockban} to meDlCfgGet("block_banned")
+    set {_capms} to meDlCfgGet("captcha_min_ms") parsed as integer
+    if {_capms} is not set:
+        set {_capms} to 2500
+    set {_freq} to meCfgGet("auto_frequency")
+    set {_keep} to meCfgGet("keep_versions")
+    set {_maxgb} to meDlCfgGet("max_gb") parsed as integer
+    if {_maxgb} is not set:
+        set {_maxgb} to 50
+
+    # ----- Ligne 0 : header centre -----
+    set {_hdr} to a written book named "&d&lParametres avances"
+    set lore of {_hdr} to "&7Configuration du systeme de" and "&7telechargement public."
+    set slot 4 of {_inv} to {_hdr}
+
+    # ----- Ligne 1 : SECTION SECURITE -----
+    set {_sec_lbl} to a redstone block named "&c&l>> Securite"
+    set lore of {_sec_lbl} to "&7Filtres anti-VPN, IP bannies" and "&7et delai anti-bot."
+    set slot 9 of {_inv} to {_sec_lbl}
+
+    # Slot 11 : block VPN
+    if {_blockvpn} is "True":
+        set {_lv} to a lever named "&aBlocage VPN : ACTIVE"
+        set lore of {_lv} to "&7IP detectees comme VPN / proxy /" and "&7hosting refusees (ip-api.com)." and "" and "&eClic gauche : &fdesactiver"
+    else:
+        set {_lv} to a redstone torch named "&cBlocage VPN : DESACTIVE"
+        set lore of {_lv} to "&7Tous les visiteurs peuvent telecharger." and "" and "&eClic gauche : &factiver"
+    set slot 11 of {_inv} to {_lv}
+
+    # Slot 13 : block bannis
+    if {_blockban} is "True":
+        set {_lb} to a lever named "&aBlocage bannis : ACTIVE"
+        set lore of {_lb} to "&7IP bannies dans LiteBans (active=1)" and "&7refusees au telechargement." and "" and "&eClic gauche : &fdesactiver"
+    else:
+        set {_lb} to a redstone torch named "&cBlocage bannis : DESACTIVE"
+        set lore of {_lb} to "&7Les IP bannies peuvent telecharger." and "" and "&eClic gauche : &factiver"
+    set slot 13 of {_inv} to {_lb}
+
+    # Slot 15 : delai captcha
+    set {_capdisp} to floor({_capms} / 100) / 10
+    set {_cap} to a clock named "&bDelai anti-bot : &f%{_capms}% ms"
+    set lore of {_cap} to "&7Temps minimum d'attente apres" and "&7la generation du token captcha." and "&7Valeur : &f%{_capms}% ms (~%{_capdisp}%s)" and "" and "&eClic gauche : +500 ms" and "&eClic droit : -500 ms"
+    set slot 15 of {_inv} to {_cap}
+
+    # Slot 17 : toggle admin auto-whitelist
+    set {_aw} to meDlCfgGet("admin_whitelist_enabled")
+    if {_aw} is "True":
+        set {_awi} to a lever named "&aAuto-whitelist admins : ACTIVE"
+        set lore of {_awi} to "&7Les staff qui rejoignent le serveur" and "&7sont auto-whitelistes pour 7 jours :" and "&7ils contournent VPN/ban (utile car" and "&7tester via /telechargement)." and "" and "&7Voir la liste : menu principal > " and "&7&liste d'acces." and "" and "&eClic gauche : &fdesactiver"
+    else:
+        set {_awi} to a redstone torch named "&cAuto-whitelist admins : DESACTIVE"
+        set lore of {_awi} to "&7Les staff ne sont plus auto-whitelistes." and "&7Ils sont traites comme des visiteurs" and "&7normaux (et seront refuses si VPN/ban)." and "" and "&eClic gauche : &factiver"
+    set slot 17 of {_inv} to {_awi}
+
+    # ----- Ligne 2 : separateur -----
+    loop integers from 18 to 26:
+        set slot loop-integer of {_inv} to a cyan stained glass pane named " "
+
+    # ----- Ligne 3 : SECTION STOCKAGE -----
+    set {_sto_lbl} to a chest named "&6&l>> Stockage"
+    set lore of {_sto_lbl} to "&7Quota du dossier de telechargements" and "&7et nombre de versions conservees."
+    set slot 27 of {_inv} to {_sto_lbl}
+
+    # Slot 30 : max_gb
+    set {_mg} to a nether star named "&eMax espace DL : &f%{_maxgb}% GB"
+    set lore of {_mg} to "&7Limite totale du dossier de telechargements." and "&7Au-dela, les anciennes versions sont purgees." and "" and "&eClic gauche : +5 GB" and "&eClic droit : -5 GB"
+    set slot 30 of {_inv} to {_mg}
+
+    # Slot 32 : keep_versions
+    set {_kp} to a book named "&dVersions conservees : &f%{_keep}%"
+    set lore of {_kp} to "&7Nombre maximal de versions datees" and "&7stockees sur le serveur (1 a 5)." and "&7Les plus anciennes sont supprimees." and "" and "&eClic gauche : +1" and "&eClic droit : -1"
+    set slot 32 of {_inv} to {_kp}
+
+    # ----- Ligne 4 : SECTION AUTOMATION & PERFORMANCES -----
+    set {_aut_lbl} to a clock named "&b&l>> Automation & performances"
+    set lore of {_aut_lbl} to "&7Frequence des exports automatiques" and "&7et limitation de bande passante."
+    set slot 36 of {_inv} to {_aut_lbl}
+
+    # Slot 40 : frequence auto
+    set {_cron_active} to "&cInactif (aucun cron)"
+    if {_freq} is not "disabled":
+        set {_cron_active} to "&aCron 02:30 actif"
+    set {_clk} to a clock named "&bFrequence auto : %meFreqDisplay({_freq})%"
+    set lore of {_clk} to "&7%{_cron_active}%" and "" and "&7Cycle : disabled > monthly > weekly > daily" and "" and "&eClic gauche : cycler"
+    set slot 40 of {_inv} to {_clk}
+
+    # Slot 44 : bande passante (ouvre sous-menu)
+    set {_bw_mode} to meDlCfgGet("bandwidth_mode")
+    if {_bw_mode} is "":
+        set {_bw_mode} to "auto"
+    set {_bw_btn} to a piston named "&eBande passante : &f%{_bw_mode}%"
+    set lore of {_bw_btn} to "&7Limite la vitesse de telechargement" and "&7par DL pour proteger le serveur." and "" and "&eClic gauche : &fconfigurer"
+    set slot 44 of {_inv} to {_bw_btn}
+
+    # ----- Ligne 5 : retour -----
+    set {_back} to a barrier named "&cRetour"
+    set lore of {_back} to "&7Revenir au menu principal."
+    set slot 49 of {_inv} to {_back}
+
+    # Filler vitres grises pour cohérence avec menu principal
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    open {_inv} to {_p}
+    set {me_settings_viewers::%uuid of {_p}%} to true
+
+# ==============================================================================
+#  GUI : menu Liste d'acces (whitelist + admins + restreints)
+# ==============================================================================
+
+function meBuildAccessMenu(p: player):
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_access_title}"
+    delete {me_access_menu_slotip::%uuid of {_p}%::*}
+    delete {me_access_menu_slotkind::%uuid of {_p}%::*}
+
+    # Recupere les donnees via /api/dl-access?fmt=pipe
+    # Format : W<n>[|ip|...]||A<n>[|ip~name~last|...]||R<n>[|ip~until~since~reason~by|...]
+    set {_raw} to meRunShell("curl -s --max-time 2 'http://localhost:8080/api/dl-access?fmt=pipe' 2>/dev/null")
+    replace all newline with "" in {_raw}
+    set {_sections::*} to split {_raw} at "||"
+    set {_wlsec} to "W0"
+    set {_adsec} to "A0"
+    set {_rsec} to "R0"
+    if {_sections::1} is set:
+        set {_wlsec} to {_sections::1}
+    if {_sections::2} is set:
+        set {_adsec} to {_sections::2}
+    if {_sections::3} is set:
+        set {_rsec} to {_sections::3}
+
+    # ----- Slot 4 : header -----
+    set {_hdr} to a paper named "&6&lListe d'acces"
+    set lore of {_hdr} to "&7Whitelist manuelle, admins auto-whitelistes" and "&7et IP restreintes (blacklist temporaire)."
+    set slot 4 of {_inv} to {_hdr}
+
+    # ----- Ligne 1 (slots 9-17) : Whitelist VPN manuelle -----
+    set {_wlparts::*} to split {_wlsec} at "|"
+    set {_wlhead} to {_wlparts::1}
+    set {_wlcount} to 0
+    if {_wlhead} starts with "W":
+        set {_wlcount_s} to subtext of {_wlhead} from characters 2 to length of {_wlhead}
+        set {_wlcount_p} to {_wlcount_s} parsed as integer
+        if {_wlcount_p} is set:
+            set {_wlcount} to {_wlcount_p}
+    set {_lbl_wl} to a writable book named "&b&l>> Whitelist VPN &7(%{_wlcount}%)"
+    set lore of {_lbl_wl} to "&7IP ajoutees manuellement qui contournent" and "&7le blocage VPN/proxy/hosting." and "" and "&8Editer via API /api/dl-cfg"
+    set slot 9 of {_inv} to {_lbl_wl}
+    set {_ws} to 10
+    if {_wlcount} > 0:
+        loop {_wlcount} times:
+            if {_ws} > 17:
+                stop loop
+            set {_widx} to loop-value + 1
+            set {_wip} to {_wlparts::%{_widx}%}
+            if {_wip} is set:
+                set {_it} to a light blue dye named "&b%{_wip}%"
+                set lore of {_it} to "&7Whitelist VPN manuelle" and "" and "&8Lecture seule depuis le menu"
+                set slot {_ws} of {_inv} to {_it}
+                set {_ws} to {_ws} + 1
+
+    # ----- Ligne 2-3 (slots 18-35) : Admins auto-whitelistes -----
+    set {_adparts::*} to split {_adsec} at "|"
+    set {_adhead} to {_adparts::1}
+    set {_adcount} to 0
+    if {_adhead} starts with "A":
+        set {_adcount_s} to subtext of {_adhead} from characters 2 to length of {_adhead}
+        set {_adcount_p} to {_adcount_s} parsed as integer
+        if {_adcount_p} is set:
+            set {_adcount} to {_adcount_p}
+    set {_lbl_ad} to a player head named "&a&l>> Admins auto-whitelistes &7(%{_adcount}%)"
+    set lore of {_lbl_ad} to "&7Admins auto-whitelistes selon leur IP" and "&7enregistree cote web." and "" and "&8Lecture seule depuis le menu"
+    set slot 18 of {_inv} to {_lbl_ad}
+    set {_as} to 19
+    if {_adcount} > 0:
+        loop {_adcount} times:
+            if {_as} > 35:
+                stop loop
+            set {_aidx} to loop-value + 1
+            set {_aentry} to {_adparts::%{_aidx}%}
+            if {_aentry} is set:
+                set {_atok::*} to split {_aentry} at "~"
+                set {_aip} to {_atok::1}
+                set {_aname} to {_atok::2}
+                if {_aip} is set:
+                    set {_it} to a lime dye named "&a%{_aname}% &7(%{_aip}%)"
+                    set lore of {_it} to "&7Admin auto-whitelist" and "&7IP : &f%{_aip}%" and "&7Pseudo : &f%{_aname}%"
+                    set slot {_as} of {_inv} to {_it}
+                    set {me_access_menu_slotip::%uuid of {_p}%::%{_as}%} to {_aip}
+                    set {me_access_menu_slotkind::%uuid of {_p}%::%{_as}%} to "admin"
+                    set {_as} to {_as} + 1
+
+    # ----- Ligne 4 (slots 36-44) : IP restreintes -----
+    set {_rparts::*} to split {_rsec} at "|"
+    set {_rhead} to {_rparts::1}
+    set {_rcount} to 0
+    if {_rhead} starts with "R":
+        set {_rcount_s} to subtext of {_rhead} from characters 2 to length of {_rhead}
+        set {_rcount_p} to {_rcount_s} parsed as integer
+        if {_rcount_p} is set:
+            set {_rcount} to {_rcount_p}
+    set {_lbl_r} to a barrier named "&c&l>> IP restreintes &7(%{_rcount}%)"
+    set lore of {_lbl_r} to "&7Blacklist temporaire : ces IP ne peuvent" and "&7plus telecharger jusqu'a la fin de" and "&7la restriction." and "" and "&eClic droit sur une entree : retirer"
+    set slot 36 of {_inv} to {_lbl_r}
+    set {_rs} to 37
+    if {_rcount} > 0:
+        loop {_rcount} times:
+            if {_rs} > 44:
+                stop loop
+            set {_ridx} to loop-value + 1
+            set {_rentry} to {_rparts::%{_ridx}%}
+            if {_rentry} is set:
+                set {_rtok::*} to split {_rentry} at "~"
+                set {_rip} to {_rtok::1}
+                set {_runtil} to {_rtok::2} parsed as number
+                set {_rsince} to {_rtok::3} parsed as number
+                set {_rreason} to {_rtok::4}
+                set {_rby} to {_rtok::5}
+                if {_rip} is set:
+                    set {_until_disp} to "&cpermanente"
+                    if {_runtil} is set:
+                        if {_runtil} > 0:
+                            set {_until_epoch} to floor({_runtil} / 1000)
+                            set {_until_disp} to meRunShell("date -d @%{_until_epoch}% '+%%d/%%m/%%Y %%H:%%M' 2>/dev/null")
+                            replace all newline with "" in {_until_disp}
+                            if {_until_disp} is "":
+                                set {_until_disp} to "&f%{_until_epoch}%"
+                    set {_it} to a red dye named "&c%{_rip}%"
+                    set lore of {_it} to "&7Restreint jusqu'au : &f%{_until_disp}%" and "&7Motif : &f%{_rreason}%" and "&7Par : &f%{_rby}%" and "" and "&eClic droit : &fretirer la restriction"
+                    set slot {_rs} of {_inv} to {_it}
+                    set {me_access_menu_slotip::%uuid of {_p}%::%{_rs}%} to {_rip}
+                    set {me_access_menu_slotkind::%uuid of {_p}%::%{_rs}%} to "restrict"
+                    set {_rs} to {_rs} + 1
+
+    # ----- Slot 49 : retour -----
+    set {_back} to a barrier named "&cRetour"
+    set lore of {_back} to "&7Revenir au menu principal."
+    set slot 49 of {_inv} to {_back}
+
+    # Filler vitres grises
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    open {_inv} to {_p}
+    set {me_access_menu_viewers::%uuid of {_p}%} to true
+
+on inventory click:
+    name of event-inventory is "{@me_gui_access_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    set {_isright} to false
+    if click type is right mouse button:
+        set {_isright} to true
+
+    if {_slot} is 49:
+        meBuildMenu(player)
+        stop
+
+    set {_kind} to {me_access_menu_slotkind::%uuid of player%::%{_slot}%}
+    set {_ip} to {me_access_menu_slotip::%uuid of player%::%{_slot}%}
+    if {_kind} is "restrict":
+        if {_isright} is true:
+            if {_ip} is set:
+                set {_safe_ip} to {_ip}
+                replace all "\042" with "" in {_safe_ip}
+                set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-unrestrict' 2>/dev/null"
+                meRunShell({_cmd})
+                send "{@me_prefix} &aRestriction levee pour &f%{_ip}%&a." to player
+                send "&6[Map] &aAdmin unrestrict &7| &fip=&b%{_ip}% &8par &f%name of player%" to console
+                wait 1 second
+                meBuildAccessMenu(player)
+                stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_access_title}"
+    delete {me_access_menu_viewers::%uuid of player%}
+    delete {me_access_menu_slotip::%uuid of player%::*}
+    delete {me_access_menu_slotkind::%uuid of player%::*}
+
+# ==============================================================================
+#  GUI : Sauvegardes serveur (versions publiees)
+#  Liste les zips dans le dossier de publication, permet de choisir lequel
+#  est expose comme "latest" sur le site de telechargement.
+# ==============================================================================
+
+function meBuildVersionsMenu(p: player):
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_versions_title}"
+    delete {me_versions_slot::%uuid of {_p}%::*}
+
+    # Charge la liste : file|size|mtime|sha256|is_latest|date_fmt|size_human
+    set {_raw} to meRunShell("{@me_script} versions_list 2>/dev/null")
+    set {_lines::*} to split {_raw} at newline
+
+    # Compte les versions effectives (lignes non vides)
+    set {_count} to 0
+    loop {_lines::*}:
+        if loop-value is not "":
+            set {_count} to {_count} + 1
+
+    # Slot 4 : header
+    set {_hdr} to a paper named "&6&lSauvegardes serveur &7- &f%{_count}%"
+    set lore of {_hdr} to "&7Toutes les sauvegardes stockees sur le serveur." and "" and "&aPomme doree &7= sauvegarde &aexposee&7 sur" and "&7norath.fr/download (publiquement telechargeable)." and "" and "&fPapier &7= sauvegarde &7&ocachee&r&7, presente sur" and "&7le serveur mais non publique." and "" and "&eClic gauche &7sur un papier : &fl'exposer." and "&cClic droit &7sur un papier : &fle supprimer." and "&7Suppression : double-clic droit pour confirmer."
+    set slot 4 of {_inv} to {_hdr}
+
+    # Layout : jusqu'a 5 sauvegardes (= keep_versions max) sur slots
+    # 20, 22, 24, 30, 32 (centre des rangees 3 et 4). On accepte jusqu'a 21
+    # sauvegardes (slots 10-16, 19-25, 28-34) au cas ou keep monte un jour.
+    set {_slot_grid::1} to 10
+    set {_slot_grid::2} to 11
+    set {_slot_grid::3} to 12
+    set {_slot_grid::4} to 13
+    set {_slot_grid::5} to 14
+    set {_slot_grid::6} to 15
+    set {_slot_grid::7} to 16
+    set {_slot_grid::8} to 19
+    set {_slot_grid::9} to 20
+    set {_slot_grid::10} to 21
+    set {_slot_grid::11} to 22
+    set {_slot_grid::12} to 23
+    set {_slot_grid::13} to 24
+    set {_slot_grid::14} to 25
+    set {_slot_grid::15} to 28
+    set {_slot_grid::16} to 29
+    set {_slot_grid::17} to 30
+    set {_slot_grid::18} to 31
+    set {_slot_grid::19} to 32
+    set {_slot_grid::20} to 33
+    set {_slot_grid::21} to 34
+
+    set {_idx} to 1
+    loop {_lines::*}:
+        if loop-value-1 is not "":
+            if {_idx} > 21:
+                # On a depasse la capacite affichable
+                stop loop
+            set {_slot_id} to {_slot_grid::%{_idx}%}
+            if {_slot_id} is set:
+                set {_tok::*} to split loop-value-1 at "|"
+                set {_v_file} to {_tok::1}
+                set {_v_size} to {_tok::2}
+                set {_v_mtime} to {_tok::3}
+                set {_v_sha} to {_tok::4}
+                set {_v_islatest} to {_tok::5}
+                set {_v_datefmt} to {_tok::6}
+                set {_v_sizeh} to {_tok::7}
+                if {_v_file} is set:
+                    set {_sha_short} to "?"
+                    if {_v_sha} is set:
+                        if length of {_v_sha} >= 8:
+                            set {_sha_short} to subtext of {_v_sha} from characters 1 to 12
+                    set {_pending_self} to false
+                    if {me_delete_pending::%uuid of {_p}%} is {_v_file}:
+                        set {_pending_self} to true
+                    if {_v_islatest} is "1":
+                        set {_it} to an enchanted golden apple named "&6&l%{_v_file}%"
+                        set lore of {_it} to "&7Date : &f%{_v_datefmt}%" and "&7Taille : &f%{_v_sizeh}%" and "&7SHA256 : &8%{_sha_short}%..." and "" and "&a&l>> EXPOSEE SUR LE SITE" and "&7Telechargeable publiquement sur norath.fr/download." and "" and "&8Pour la supprimer, expose d'abord une autre sauvegarde."
+                    else if {_pending_self} is true:
+                        set {_it} to a tnt named "&c&lConfirmer la suppression ?"
+                        set lore of {_it} to "&f%{_v_file}%" and "&7Date : &f%{_v_datefmt}%" and "&7Taille : &f%{_v_sizeh}%" and "" and "&c&lClic droit a nouveau &cdans 5s pour confirmer." and "&7Tout autre clic annule."
+                    else:
+                        set {_it} to a paper named "&f%{_v_file}%"
+                        set lore of {_it} to "&7Date : &f%{_v_datefmt}%" and "&7Taille : &f%{_v_sizeh}%" and "&7SHA256 : &8%{_sha_short}%..." and "" and "&7&oCachee &8&o(stockee sur le serveur, non publique)" and "" and "&eClic gauche : &fexposer sur le site" and "&cClic droit : &fsupprimer du serveur"
+                    set slot {_slot_id} of {_inv} to {_it}
+                    set {me_versions_slot::%uuid of {_p}%::%{_slot_id}%} to {_v_file}
+            set {_idx} to {_idx} + 1
+
+    # Slot 49 : retour
+    set {_back} to a barrier named "&cRetour"
+    set lore of {_back} to "&7Revenir au menu principal."
+    set slot 49 of {_inv} to {_back}
+
+    # Filler vitres grises
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a gray stained glass pane named " "
+
+    # Flag : empeche le handler `on inventory close` de wiper les vars
+    # (pending, slot mapping, gen) quand on rouvre juste le meme menu.
+    set {me_versions_rebuilding::%uuid of {_p}%} to true
+    open {_inv} to {_p}
+    set {me_versions_menu_viewers::%uuid of {_p}%} to true
+    # Le close event a deja fire de maniere synchrone pendant `open` ;
+    # on retire le flag au tick suivant pour autoriser un vrai close
+    # (Escape / autre menu) a re-nettoyer.
+    wait 2 ticks
+    delete {me_versions_rebuilding::%uuid of {_p}%}
+
+# Tache differee qui repasse la TNT en papier 6s apres un 1er clic droit
+# si aucune autre action n'a consomme le pending (compteur de generation).
+function meExpireDeletePending(p: player, gen_at_schedule: text):
+    wait 6 seconds
+    set {_uuid_s} to "%uuid of {_p}%"
+    set {_cur_gen} to "%{me_delete_pending_gen::%{_uuid_s}%}%"
+    if {_cur_gen} is not {_gen_at_schedule}:
+        # Une autre action (2e clic, clic gauche, fermeture) a deja
+        # consomme le pending : rien a faire.
+        stop
+    # Aucun nouveau clic depuis : expire le pending et repeint si visible.
+    delete {me_delete_pending::%{_uuid_s}%}
+    delete {me_delete_pending_ts::%{_uuid_s}%}
+    if {me_versions_menu_viewers::%{_uuid_s}%} is not set:
+        stop
+    if {_p} is not online:
+        stop
+    meBuildVersionsMenu({_p})
+
+on inventory click:
+    name of event-inventory is "{@me_gui_versions_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    if {_slot} is not set:
+        stop
+    if {_slot} >= 54:
+        stop
+
+    if {_slot} is 49:
+        meBuildMenu(player)
+        stop
+
+    set {_file} to {me_versions_slot::%uuid of player%::%{_slot}%}
+    if {_file} is set:
+        # Detection du clic via le meme pattern eprouve que les autres
+        # menus de ce script (cf. menu bandwidth ligne ~1770).
+        set {_ct} to "%click type%" in upper case
+        set {_is_right} to false
+        if {_ct} contains "RIGHT":
+            set {_is_right} to true
+        set {_is_left} to false
+        if {_ct} contains "LEFT":
+            set {_is_left} to true
+
+        # Securite : quoter le nom (caracteres autorises seulement, mais le
+        # script shell revalide aussi cote serveur).
+        set {_safe_file} to {_file}
+        replace all "'" with "" in {_safe_file}
+        replace all "\042" with "" in {_safe_file}
+        replace all ";" with "" in {_safe_file}
+        replace all "&" with "" in {_safe_file}
+        replace all "|" with "" in {_safe_file}
+        replace all " " with "" in {_safe_file}
+
+        # ---- Clic droit : suppression (avec double-clic de confirmation) ----
+        if {_is_right} is true:
+            set {_now_s} to unix timestamp of now
+            set {_pending} to {me_delete_pending::%uuid of player%}
+            set {_pending_ts} to {me_delete_pending_ts::%uuid of player%}
+            set {_confirmed} to false
+            if {_pending} is {_safe_file}:
+                if {_pending_ts} is set:
+                    if {_now_s} - {_pending_ts} <= 5:
+                        set {_confirmed} to true
+            if {_confirmed} is true:
+                delete {me_delete_pending::%uuid of player%}
+                delete {me_delete_pending_ts::%uuid of player%}
+                add 1 to {me_delete_pending_gen::%uuid of player%}
+                # Indicateur "en cours" : remplace le slot par une barriere rouge
+                set {_busy} to a barrier named "&c&lSuppression en cours..."
+                set lore of {_busy} to "&7Suppression de &f%{_safe_file}%&7 sur disque." and "&7Patience, le menu va se rafraichir."
+                set slot {_slot} of event-inventory to {_busy}
+                send "{@me_prefix} &7Suppression de &f%{_safe_file}% &7en cours..." to player
+                set {_res} to meRunShell("{@me_script} delete_version '%{_safe_file}%' 2>&1")
+                meInvalidateCache()
+                set {_err} to false
+                if {_res} contains "ERREUR:":
+                    set {_err} to true
+                if {_err} is true:
+                    send "{@me_prefix} &cEchec : %{_res}%" to player
+                else:
+                    send "{@me_prefix} &aSauvegarde supprimee : &f%{_safe_file}%" to player
+                    send "&6[Map] &cAdmin delete_version &7| &ffile=&b%{_safe_file}% &8par &f%name of player%" to console
+                wait 5 ticks
+                meBuildVersionsMenu(player)
+                stop
+            # Premier clic : marque pending et rafraichit le menu pour
+            # afficher l'item "TNT confirmer" sur ce slot.
+            set {me_delete_pending::%uuid of player%} to {_safe_file}
+            set {me_delete_pending_ts::%uuid of player%} to {_now_s}
+            # Compteur de generation : permet au timeout async de savoir
+            # si un nouveau clic est intervenu entre temps.
+            add 1 to {me_delete_pending_gen::%uuid of player%}
+            set {_my_gen} to "%{me_delete_pending_gen::%uuid of player%}%"
+            send "{@me_prefix} &c&lConfirme la suppression &7de &f%{_safe_file}%&7 : clic droit a nouveau dans 5s." to player
+            meBuildVersionsMenu(player)
+            # Timeout 6s : si aucun nouveau clic, repasse TNT -> papier.
+            meExpireDeletePending(player, {_my_gen})
+            stop
+
+        # ---- Clic gauche : exposer comme latest ----
+        if {_is_left} is true:
+            # Annule un pending de suppression sur autre item.
+            delete {me_delete_pending::%uuid of player%}
+            delete {me_delete_pending_ts::%uuid of player%}
+            add 1 to {me_delete_pending_gen::%uuid of player%}
+            # Anti-spam : cooldown 2s
+            set {_now_s} to unix timestamp of now
+            set {_last_s} to {me_setlatest_last_click::%uuid of player%}
+            if {_last_s} is set:
+                if {_now_s} - {_last_s} < 2:
+                    send "{@me_prefix} &7Patientez un instant..." to player
+                    stop
+            set {me_setlatest_last_click::%uuid of player%} to {_now_s}
+
+            # Si on clique sur l'item deja expose, c'est un no-op.
+            set {_busy} to a clock named "&e&lMise a jour..."
+            set lore of {_busy} to "&7Exposition de &f%{_safe_file}%&7 sur le site."
+            set slot {_slot} of event-inventory to {_busy}
+            send "{@me_prefix} &7Exposition de &f%{_safe_file}% &7en cours..." to player
+
+            set {_res} to meRunShell("{@me_script} set_latest '%{_safe_file}%' 2>&1")
+            meInvalidateCache()
+            if {_res} contains "ERREUR:":
+                send "{@me_prefix} &cEchec : %{_res}%" to player
+            else:
+                send "{@me_prefix} &aSauvegarde exposee sur le site : &f%{_safe_file}%" to player
+                send "&6[Map] &aAdmin set_latest &7| &ffile=&b%{_safe_file}% &8par &f%name of player%" to console
+            wait 5 ticks
+            meBuildVersionsMenu(player)
+            stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_versions_title}"
+    # Si on est en plein rebuild du meme menu (open enchaine), ne pas
+    # wiper l'etat : le rebuild vient de poser les bonnes valeurs.
+    if {me_versions_rebuilding::%uuid of player%} is set:
+        stop
+    delete {me_versions_menu_viewers::%uuid of player%}
+    delete {me_versions_slot::%uuid of player%::*}
+    delete {me_delete_pending::%uuid of player%}
+    delete {me_delete_pending_ts::%uuid of player%}
+    add 1 to {me_delete_pending_gen::%uuid of player%}
+
+# ==============================================================================
+#  GUI : configuration bande passante (rate limit telechargements)
+# ==============================================================================
+
+function meKbsDisplay(kbs: number) :: text:
+    if {_kbs} >= 1024:
+        set {_mb} to {_kbs} / 1024
+        return "%{_mb}% MB/s"
+    return "%{_kbs}% KB/s"
+
+# Petit helper visuel : item "inactif" (vitre teintee + label gris) utilise
+# quand un reglage n'est pas pris en compte par le mode courant.
+function meBwInactiveItem(label: text, reason: text) :: item:
+    set {_it} to a gray stained glass pane named "&8&m%{_label}%"
+    set lore of {_it} to "&8Inactif &7- %{_reason}%" and "" and "&7Change le mode (slot du milieu) pour" and "&7activer ce reglage."
+    return {_it}
+
+function meBuildBandwidthMenu(p: player):
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_bw_title}"
+
+    # --- Lecture etat courant ---
+    set {_mode} to meDlCfgGet("bandwidth_mode")
+    if {_mode} is "":
+        set {_mode} to "auto"
+    set {_perUser} to meDlCfgGet("bandwidth_per_user_kbs") parsed as number
+    if {_perUser} is not set:
+        set {_perUser} to 10240
+    set {_total} to meDlCfgGet("bandwidth_total_kbs") parsed as number
+    if {_total} is not set:
+        set {_total} to 51200
+    set {_minK} to meDlCfgGet("bandwidth_min_kbs") parsed as number
+    if {_minK} is not set:
+        set {_minK} to 2048
+    set {_maxK} to meDlCfgGet("bandwidth_max_kbs") parsed as number
+    if {_maxK} is not set:
+        set {_maxK} to 20480
+    set {_thr} to meDlCfgGet("bandwidth_load_threshold") parsed as number
+    if {_thr} is not set:
+        set {_thr} to 0
+    set {_pen} to meDlCfgGet("bandwidth_load_penalty_pct") parsed as number
+    if {_pen} is not set:
+        set {_pen} to 50
+
+    # --- Slot 4 : header explicatif ---
+    set {_hdr} to a piston named "&6&lBande passante"
+    if {_mode} is "auto":
+        set {_modesum} to "&aAUTO &8(partage equitable)"
+    else if {_mode} is "manual":
+        set {_modesum} to "&6MANUAL &8(vitesse fixe)"
+    else:
+        set {_modesum} to "&cUNLIMITED &8(aucune limite)"
+    set lore of {_hdr} to "&7Limite la vitesse de telechargement" and "&7des joueurs qui recuperent la map," and "&7pour proteger le serveur Minecraft" and "&7d'une saturation du reseau ou du CPU." and "" and "&7Mode actuel : %{_modesum}%"
+    set slot 4 of {_inv} to {_hdr}
+
+    # --- Slot 13 : selecteur de mode (cycle clic gauche) ---
+    if {_mode} is "auto":
+        set {_modeItem} to a comparator named "&eMode : &a&lAUTO"
+        set lore of {_modeItem} to "&7Le serveur calcule la vitesse de" and "&7chaque telechargement automatiquement :" and "&f  vitesse = total / nb_DL_actifs" and "&7en respectant un &fplancher &7et un &fplafond&7." and "" and "&8Recommande pour la plupart des cas." and "" and "&eClic gauche : &fpasser en MANUAL"
+    else if {_mode} is "manual":
+        set {_modeItem} to a lever named "&eMode : &6&lMANUAL"
+        set lore of {_modeItem} to "&7Chaque telechargement obtient la" and "&7meme vitesse fixe, peu importe" and "&7combien de monde telecharge." and "" and "&8Pratique pour tester ou imposer" and "&8une limite franche." and "" and "&eClic gauche : &fpasser en UNLIMITED"
+    else:
+        set {_modeItem} to a beacon named "&eMode : &c&lUNLIMITED"
+        set lore of {_modeItem} to "&cAucune limite de vitesse." and "&7Les telechargements vont aussi vite" and "&7que le reseau le permet." and "" and "&c&lATTENTION : &7peut saturer le lien" and "&7du serveur et faire lagger Minecraft." and "" and "&eClic gauche : &fpasser en AUTO"
+    set slot 13 of {_inv} to {_modeItem}
+
+    # --- Slot 22 : MANUAL.per_user_kbs ---
+    if {_mode} is "manual":
+        set {_perUserItem} to an iron ingot named "&fVitesse par telechargement : &b%meKbsDisplay({_perUser})%"
+        set lore of {_perUserItem} to "&7Vitesse imposee a chaque telechargement" and "&7quand le mode est &6MANUAL&7." and "" and "&7Exemple : 10 MB/s = chacun telecharge a" and "&710 MB/s peu importe combien sont en cours." and "" and "&eClic gauche : &f+1 MB/s" and "&eClic droit : &f-1 MB/s" and "&eShift + clic : &fpas de 10 MB/s"
+    else:
+        set {_perUserItem} to meBwInactiveItem("Vitesse par DL (manual)", "mode MANUAL requis")
+    set slot 22 of {_inv} to {_perUserItem}
+
+    # --- Slots 29 / 31 / 33 : AUTO total/plancher/plafond ---
+    if {_mode} is "auto":
+        set {_totalItem} to a gold ingot named "&fTotal partage : &b%meKbsDisplay({_total})%"
+        set lore of {_totalItem} to "&7Bande passante totale a se partager" and "&7entre tous les telechargements actifs." and "" and "&7Exemple : 50 MB/s total + 5 DL en cours" and "&7-> chacun ~10 MB/s (borne par plancher/plafond)." and "" and "&eClic gauche : &f+5 MB/s" and "&eClic droit : &f-5 MB/s" and "&eShift + clic : &fpas de 25 MB/s"
+
+        set {_minItem} to a redstone block named "&fPlancher : &b%meKbsDisplay({_minK})%"
+        set lore of {_minItem} to "&7Vitesse &fminimale &7garantie a chaque DL," and "&7meme s'il y a beaucoup de monde." and "" and "&7Exemple : meme avec 100 DL, personne" and "&7ne descend en dessous de cette valeur." and "" and "&eClic gauche : &f+0.5 MB/s" and "&eClic droit : &f-0.5 MB/s" and "&eShift + clic : &fpas de 2 MB/s"
+
+        set {_maxItem} to a diamond named "&fPlafond : &b%meKbsDisplay({_maxK})%"
+        set lore of {_maxItem} to "&7Vitesse &fmaximale &7par DL, meme" and "&7quand peu de monde telecharge." and "" and "&7Evite qu'un seul joueur sature" and "&7toute la bande passante." and "" and "&eClic gauche : &f+5 MB/s" and "&eClic droit : &f-5 MB/s" and "&eShift + clic : &fpas de 25 MB/s"
+    else:
+        set {_totalItem} to meBwInactiveItem("Total partage (auto)", "mode AUTO requis")
+        set {_minItem} to meBwInactiveItem("Plancher (auto)", "mode AUTO requis")
+        set {_maxItem} to meBwInactiveItem("Plafond (auto)", "mode AUTO requis")
+    set slot 29 of {_inv} to {_totalItem}
+    set slot 31 of {_inv} to {_minItem}
+    set slot 33 of {_inv} to {_maxItem}
+
+    # --- Slots 40 / 42 : Protection serveur (toujours actif sauf UNLIMITED) ---
+    if {_mode} is "unlimited":
+        set {_thrItem} to meBwInactiveItem("Protection load", "desactivee en UNLIMITED")
+        set {_penItem} to meBwInactiveItem("Penalite load", "desactivee en UNLIMITED")
+    else:
+        if {_thr} <= 0:
+            set {_thrItem} to a coal block named "&fProtection load : &8desactivee"
+            set lore of {_thrItem} to "&7Si le serveur est tres charge (la machine" and "&7tourne a fond), on peut reduire la vitesse" and "&7des DL pour soulager Minecraft." and "" and "&7&oLa &fload average 1min&7&o est une mesure" and "&7&oLinux : ~= nombre de coeurs occupes." and "&7&oExemple sur 4 coeurs : 4.0 = sature." and "" and "&7Etat : &8desactive &7(seuil = 0)" and "" and "&eClic gauche : &f+0.5 (active)" and "&eClic droit : &f-0.5" and "&eShift + clic : &fpas de 2"
+        else:
+            set {_thrItem} to a redstone torch named "&fProtection load : &eseuil = &b%{_thr}%"
+            set lore of {_thrItem} to "&7Si le serveur est tres charge (la machine" and "&7tourne a fond), on peut reduire la vitesse" and "&7des DL pour soulager Minecraft." and "" and "&7&oLa &fload average 1min&7&o est une mesure" and "&7&oLinux : ~= nombre de coeurs occupes." and "&7&oExemple sur 4 coeurs : 4.0 = sature." and "" and "&7Au-dela de &b%{_thr}%&7, vitesse reduite de &b%{_pen}%%%&7." and "" and "&eClic gauche : &f+0.5" and "&eClic droit : &f-0.5 &8(0 = desactive)" and "&eShift + clic : &fpas de 2"
+
+        set {_penItem} to a tnt named "&fPenalite : &b-%{_pen}%&f%%"
+        set lore of {_penItem} to "&7Reduction appliquee a la vitesse de DL" and "&7quand le seuil de load est depasse." and "" and "&7Exemple : 50%% -> les DL tournent a" and "&7la moitie de leur vitesse normale." and "" and "&eClic gauche : &f+5%%" and "&eClic droit : &f-5%%"
+    set slot 40 of {_inv} to {_thrItem}
+    set slot 42 of {_inv} to {_penItem}
+
+    # --- Slot 49 : retour ---
+    set {_back} to an arrow named "&eRetour aux parametres"
+    set lore of {_back} to "&7Revenir au menu parametres avances."
+    set slot 49 of {_inv} to {_back}
+
+    # --- Filler vitres grises pour cohérence avec les autres menus ---
+    loop integers from 0 to 53:
+        if slot loop-integer of {_inv} is air:
+            set slot loop-integer of {_inv} to a black stained glass pane named " "
+
+    open {_inv} to {_p}
+
+on inventory click:
+    name of event-inventory is "{@me_gui_bw_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    if {_slot} is not set:
+        stop
+    if {_slot} >= 54:
+        stop
+
+    set {_ct} to "%click type%" in upper case
+    set {_isShift} to false
+    if {_ct} contains "SHIFT":
+        set {_isShift} to true
+    set {_isLeft} to false
+    if {_ct} contains "LEFT":
+        set {_isLeft} to true
+    set {_isRight} to false
+    if {_ct} contains "RIGHT":
+        set {_isRight} to true
+
+    # Retour
+    if {_slot} is 49:
+        meBuildSettingsMenu(player)
+        stop
+
+    set {_mode} to meDlCfgGet("bandwidth_mode")
+    if {_mode} is "":
+        set {_mode} to "auto"
+
+    # Mode cycle (clic gauche seulement)
+    if {_slot} is 13:
+        if {_isLeft} is true:
+            if {_mode} is "auto":
+                meDlCfgSet("bandwidth_mode", "\042manual\042")
+            else if {_mode} is "manual":
+                meDlCfgSet("bandwidth_mode", "\042unlimited\042")
+            else:
+                meDlCfgSet("bandwidth_mode", "\042auto\042")
+            meBuildBandwidthMenu(player)
+        stop
+
+    # Helpers de pas selon slot
+    set {_step} to 0
+    set {_field} to ""
+    set {_minV} to 64
+    set {_maxV} to 1048576
+    set {_requiresMode} to ""
+
+    if {_slot} is 22:
+        set {_field} to "bandwidth_per_user_kbs"
+        set {_requiresMode} to "manual"
+        if {_isShift} is true:
+            set {_step} to 10240
+        else:
+            set {_step} to 1024
+    else if {_slot} is 29:
+        set {_field} to "bandwidth_total_kbs"
+        set {_requiresMode} to "auto"
+        if {_isShift} is true:
+            set {_step} to 25600
+        else:
+            set {_step} to 5120
+    else if {_slot} is 31:
+        set {_field} to "bandwidth_min_kbs"
+        set {_requiresMode} to "auto"
+        if {_isShift} is true:
+            set {_step} to 2048
+        else:
+            set {_step} to 512
+    else if {_slot} is 33:
+        set {_field} to "bandwidth_max_kbs"
+        set {_requiresMode} to "auto"
+        if {_isShift} is true:
+            set {_step} to 25600
+        else:
+            set {_step} to 5120
+    else if {_slot} is 40:
+        set {_field} to "bandwidth_load_threshold"
+        set {_minV} to 0
+        set {_maxV} to 64
+        if {_mode} is "unlimited":
+            set {_requiresMode} to "auto-or-manual"
+        if {_isShift} is true:
+            set {_step} to 2
+        else:
+            set {_step} to 0.5
+    else if {_slot} is 42:
+        set {_field} to "bandwidth_load_penalty_pct"
+        set {_minV} to 0
+        set {_maxV} to 95
+        if {_mode} is "unlimited":
+            set {_requiresMode} to "auto-or-manual"
+        set {_step} to 5
+
+    if {_field} is "":
+        stop
+
+    # Verifie que le mode courant autorise la modification
+    if {_requiresMode} is "manual":
+        if {_mode} is not "manual":
+            send "{@me_prefix} &7Ce reglage n'est actif qu'en mode &6MANUAL&7." to player
+            stop
+    if {_requiresMode} is "auto":
+        if {_mode} is not "auto":
+            send "{@me_prefix} &7Ce reglage n'est actif qu'en mode &aAUTO&7." to player
+            stop
+    if {_requiresMode} is "auto-or-manual":
+        send "{@me_prefix} &7La protection load est desactivee en mode &cUNLIMITED&7." to player
+        stop
+
+    set {_cur} to meDlCfgGet({_field}) parsed as number
+    if {_cur} is not set:
+        set {_cur} to 0
+    if {_isLeft} is true:
+        set {_new} to {_cur} + {_step}
+    else if {_isRight} is true:
+        set {_new} to {_cur} - {_step}
+    else:
+        stop
+    if {_new} < {_minV}:
+        set {_new} to {_minV}
+    if {_new} > {_maxV}:
+        set {_new} to {_maxV}
+    meDlCfgSet({_field}, "%{_new}%")
+    meBuildBandwidthMenu(player)
+
+# ==============================================================================
+#  GUI : menu de configuration
+# ==============================================================================
+
+# Construit l'item run/cancel (extrait pour pouvoir le rafraichir tick-by-tick).
+function meBuildRunItem(phase: text) :: item:
+    if meIsActivePhase({_phase}) is true:
+        set {_pct_s} to meReadProgress("pct")
+        set {_pct_n} to {_pct_s} parsed as integer
+        if {_pct_n} is not set:
+            set {_pct_n} to 0
+        set {_eta_s} to meReadProgress("eta_seconds")
+        set {_eta_n} to {_eta_s} parsed as integer
+        if {_eta_n} is not set:
+            set {_eta_n} to 0
+        set {_bar} to meProgressBar({_pct_n})
+        set {_phase_fr} to mePhaseDisplay({_phase})
+        set {_run} to a barrier named "&cAnnuler l'export &7(%{_pct_n}%%%)"
+        set lore of {_run} to "&7Phase : &f%{_phase_fr}%" and "&7Barre : %{_bar}%" and "&7ETA : %meEtaDisplay({_eta_n})%" and "" and "&eClic gauche : &fAnnuler proprement l'export"
+        return {_run}
+    else:
+        set {_run} to an emerald named "&aLancer un export maintenant"
+        set lore of {_run} to "&7Genere une nouvelle version immediatement." and "&7Duree : ~10 minutes pour 25 GB." and "&7Le serveur reste en ligne." and "" and "&eClic gauche : &flancer"
+        return {_run}
+
+function meBuildMenu(p: player):
+    set {_inv} to chest inventory with 6 rows named "{@me_gui_title}"
+
+    # Lecture etat actuel
+    set {_enabled} to meStatusValue("enabled")
+    set {_keep} to meCfgGet("keep_versions")
+    set {_latest} to meStatusValue("latest")
+    set {_count} to meStatusValue("versions_count")
+    set {_freeb} to meStatusValue("free_bytes")
+    set {_lastrun} to meCfgGet("last_auto_run")
+    set {_phase} to meReadProgress("phase")
+
+    # Calculs d'affichage
+    set {_freegb} to "?"
+    if {_freeb} is set:
+        set {_freegb} to floor(({_freeb} parsed as number) / 1073741824)
+    set {_used_dl_gb} to "?"
+    if {me_dl::used_bytes} is set:
+        set {_used_dl_gb} to floor({me_dl::used_bytes} / 1073741824)
+    set {_maxgb} to meDlCfgGet("max_gb") parsed as integer
+    if {_maxgb} is not set:
+        set {_maxgb} to 50
+    set {_lastrun_epoch} to {_lastrun} parsed as integer
+    set {_lastrun_disp} to "&cJamais"
+    if {_lastrun_epoch} is set:
+        if {_lastrun_epoch} > 0:
+            set {_lastrun_disp} to meRunShell("date -d @%{_lastrun_epoch}% '+%%d/%%m/%%Y %%H:%%M' 2>/dev/null")
+            replace all newline with "" in {_lastrun_disp}
+            if {_lastrun_disp} is "":
+                set {_lastrun_disp} to "&f%{_lastrun_epoch}%"
+
+    # ----- Layout 6 lignes (54 slots) -----
+    # Row 2 (slot 13)        : header
+    # Row 3 (20, 22, 24)     : lever / DL eye / run-cancel
+    # Row 5 (38, 40, 42)     : access / status / settings
+    # Row 6 (slot 53)        : close
+
+    # Slot 13 : header
+    set {_header} to a written book named "&6&lXEINORIA &7- &fMap Export"
+    set lore of {_header} to "&7Hub de gestion du telechargement" and "&7public de la map survie." and "" and "&8Licence : CC BY-NC-SA 4.0"
+    set slot 13 of {_inv} to {_header}
+
+    # Slot 20 : acces public (lever / torch)
+    if {_enabled} is "true":
+        set {_lever} to a lever named "&aAcces public : ACTIVE"
+        set lore of {_lever} to "&7Les visiteurs peuvent telecharger" and "&7la map depuis norath.fr/telechargement." and "" and "&eClic gauche : &fdesactiver"
+    else:
+        set {_lever} to a redstone torch named "&cAcces public : DESACTIVE"
+        set lore of {_lever} to "&7Le telechargement renvoie 503." and "" and "&eClic gauche : &factiver"
+    set slot 20 of {_inv} to {_lever}
+
+    # Slot 22 : téléchargements actifs (oeil)
+    set {_dl_eye} to meBuildDlItem()
+    add "" to lore of {_dl_eye}
+    add "&eClic gauche : &fouvrir la vue telechargements" to lore of {_dl_eye}
+    set slot 22 of {_inv} to {_dl_eye}
+
+    # Slot 24 : toggle run / cancel
+    set slot 24 of {_inv} to meBuildRunItem({_phase})
+
+    # Slot 40 : status (compass)
+    set {_status} to a compass named "&7Etat actuel"
+    set {_latest_size} to meStatusValue("latest_size")
+    set {_latestdisp} to "&f%{_latest}%"
+    if {_latest} is "":
+        set {_latestdisp} to "&caucune"
+    if {_latest} is "none":
+        set {_latestdisp} to "&caucune"
+    if {_latest_size} is "":
+        set {_latestdisp} to "&caucune"
+    set lore of {_status} to "&7Derniere version : %{_latestdisp}%" and "&7Versions stockees : &f%{_count}% / &7max &f%{_keep}%" and "&7Telecharger. : &f%{_used_dl_gb}% GB &8/ &f%{_maxgb}% GB max" and "&7Espace libre : &f%{_freegb}% GB" and "&7Dernier auto-run : %{_lastrun_disp}%" and "" and "&eClic gauche : &fgerer les sauvegardes"
+    set slot 40 of {_inv} to {_status}
+
+    # Slot 42 : paramètres avancés
+    set {_settings} to a writable book named "&dParametres avances"
+    set lore of {_settings} to "&7Blocage VPN / IP bannies," and "&7delai anti-bot, max espace DL," and "&7frequence auto, versions conservees." and "" and "&eClic gauche : &fouvrir"
+    set slot 42 of {_inv} to {_settings}
+
+    # Slot 38 : liste d'acces (whitelist / admins / restreints)
+    # Tete = skin du joueur qui ouvre le menu.
+    set {_access} to skull of {_p}
+    set name of {_access} to "&bListe d'acces"
+    set lore of {_access} to "&7Whitelist VPN manuelle, admins" and "&7auto-whitelistes et IP restreintes." and "" and "&eClic gauche : &fouvrir"
+    set slot 38 of {_inv} to {_access}
+
+    # Slot 53 : close (barrier)
+    set {_close} to a barrier named "&cFermer"
+    set slot 53 of {_inv} to {_close}
+
+    # Remplissage decoratif slots vides
+    loop integers from 0 to 53:
+        if slot loop-value of {_inv} is air:
+            set {_filler} to a gray stained glass pane named " "
+            set slot loop-value of {_inv} to {_filler}
+
+    open {_inv} to {_p}
+    set metadata value "me_menu_open" of {_p} to true
+    set {me_menu_viewers::%uuid of {_p}%} to true
+
+# ------------------------------------------------------------------------------
+#  Gestion des clics dans le menu
+# ------------------------------------------------------------------------------
+
+on inventory click:
+    name of event-inventory is "{@me_gui_title}"
+    cancel event
+    # Securite : la permission est revalidee (cas LuckPerms qui revoque
+    # alors que le menu est ouvert).
+    if player does not have permission "xeinoria.mapexport":
+        send "{@me_prefix} &cPermission revoquee." to player
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    set {_isright} to false
+    if click type is right mouse button:
+        set {_isright} to true
+
+    if {_slot} is 53:
+        close player's inventory
+        stop
+
+    if {_slot} is 20:
+        # Toggle acces public
+        set {_cur} to meStatusValue("enabled")
+        if {_cur} is "true":
+            meRunShell("{@me_script} disable")
+            send "{@me_prefix} &cAcces public desactive." to player
+        else:
+            meRunShell("{@me_script} enable")
+            send "{@me_prefix} &aAcces public active." to player
+        meInvalidateCache()
+        meBuildMenu(player)
+        stop
+
+    if {_slot} is 22:
+        # Ouvrir la vue telechargements
+        meBuildDlMenu(player)
+        stop
+
+    if {_slot} is 24:
+        # Toggle run / cancel avec protection anti-spam (cooldown 2s)
+        set {_now_s} to unix timestamp of now
+        set {_last_s} to {me_export_last_click::%uuid of player%}
+        if {_last_s} is set:
+            if {_now_s} - {_last_s} < 2:
+                send "{@me_prefix} &7Patientez un instant..." to player
+                stop
+        set {me_export_last_click::%uuid of player%} to {_now_s}
+        set {_cur_phase} to meReadProgress("phase")
+        if meIsActivePhase({_cur_phase}) is true:
+            meRunShell("{@me_script} cancel")
+            meInvalidateCache()
+            send "{@me_prefix} &cAnnulation envoyee. L'export s'arretera dans quelques secondes." to player
+            meBuildMenu(player)
+            stop
+        set {me_export_player} to player
+        set {_export_result} to meTriggerExport()
+        if {_export_result} starts with "&c":
+            send "{@me_prefix} %{_export_result}%" to player
+            delete {me_export_player}
+        else:
+            send "{@me_prefix} &aLancement de l'export en arriere-plan..." to player
+        meBuildMenu(player)
+        stop
+
+    if {_slot} is 42:
+        # Ouvrir la page paramètres avancés
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 38:
+        # Ouvrir la liste d'acces
+        meBuildAccessMenu(player)
+        stop
+
+    if {_slot} is 40:
+        # Ouvrir la liste des sauvegardes
+        meBuildVersionsMenu(player)
+        stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_title}"
+    delete metadata value "me_menu_open" of player
+    delete {me_menu_viewers::%uuid of player%}
+
+# ------------------------------------------------------------------------------
+#  Gestion des clics dans le menu Paramètres avancés
+# ------------------------------------------------------------------------------
+
+on inventory click:
+    name of event-inventory is "{@me_gui_settings_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        send "{@me_prefix} &cPermission revoquee." to player
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    set {_isright} to false
+    if click type is right mouse button:
+        set {_isright} to true
+
+    if {_slot} is 49:
+        meBuildMenu(player)
+        stop
+
+    if {_slot} is 11:
+        # Toggle block_vpn
+        set {_cur} to meDlCfgGet("block_vpn")
+        if {_cur} is "True":
+            meDlCfgSet("block_vpn", "false")
+            send "{@me_prefix} &cBlocage VPN desactive." to player
+        else:
+            meDlCfgSet("block_vpn", "true")
+            send "{@me_prefix} &aBlocage VPN active." to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 13:
+        # Toggle block_banned
+        set {_cur} to meDlCfgGet("block_banned")
+        if {_cur} is "True":
+            meDlCfgSet("block_banned", "false")
+            send "{@me_prefix} &cBlocage bannis desactive." to player
+        else:
+            meDlCfgSet("block_banned", "true")
+            send "{@me_prefix} &aBlocage bannis active." to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 17:
+        # Toggle admin_whitelist_enabled
+        set {_cur} to meDlCfgGet("admin_whitelist_enabled")
+        if {_cur} is "True":
+            meDlCfgSet("admin_whitelist_enabled", "false")
+            send "{@me_prefix} &cAuto-whitelist admins desactivee." to player
+        else:
+            meDlCfgSet("admin_whitelist_enabled", "true")
+            send "{@me_prefix} &aAuto-whitelist admins activee." to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 15:
+        # +/- captcha_min_ms (pas 500)
+        set {_n} to meDlCfgGet("captcha_min_ms") parsed as integer
+        if {_n} is not set:
+            set {_n} to 2500
+        if {_isright} is true:
+            set {_n} to {_n} - 500
+        else:
+            set {_n} to {_n} + 500
+        if {_n} < 0:
+            set {_n} to 0
+        if {_n} > 30000:
+            set {_n} to 30000
+        meDlCfgSet("captcha_min_ms", "%{_n}%")
+        send "{@me_prefix} &7Delai anti-bot : &f%{_n}% ms" to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 30:
+        # +/- max_gb
+        set {_n} to meDlCfgGet("max_gb") parsed as integer
+        if {_n} is not set:
+            set {_n} to 50
+        if {_isright} is true:
+            set {_n} to {_n} - 5
+        else:
+            set {_n} to {_n} + 5
+        if {_n} < 10:
+            set {_n} to 10
+        if {_n} > 500:
+            set {_n} to 500
+        meDlCfgSet("max_gb", "%{_n}%")
+        send "{@me_prefix} &7Max espace DL : &f%{_n}% GB" to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 40:
+        # Cycle frequence auto
+        set {_cur} to meCfgGet("auto_frequency")
+        set {_new} to meCycleFreq({_cur})
+        meCfgSet("auto_frequency", {_new})
+        if {_cur} is "disabled":
+            meRunShell("(crontab -l 2>/dev/null | grep -v export_map.sh; echo '30 2 * * * {@me_script} cron_tick >> {@me_scripts_dir}/export_map.log 2>&1') | crontab -")
+            send "{@me_prefix} &aCron installe (02:30 chaque jour)." to player
+        if {_new} is "disabled":
+            meRunShell("(crontab -l 2>/dev/null | grep -v export_map.sh) | crontab -")
+            send "{@me_prefix} &cCron supprime." to player
+        send "{@me_prefix} &7Frequence auto : %meFreqDisplay({_new})%" to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 32:
+        # +/- keep_versions
+        set {_cur} to meCfgGet("keep_versions")
+        set {_n} to {_cur} parsed as integer
+        if {_n} is not set:
+            set {_n} to 2
+        if {_isright} is true:
+            set {_n} to {_n} - 1
+        else:
+            set {_n} to {_n} + 1
+        if {_n} < 1:
+            set {_n} to 1
+        if {_n} > 5:
+            set {_n} to 5
+        meCfgSet("keep_versions", "%{_n}%")
+        send "{@me_prefix} &7Versions conservees : &f%{_n}%" to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 44:
+        # Ouvrir la configuration bande passante
+        meBuildBandwidthMenu(player)
+        stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_settings_title}"
+    delete {me_settings_viewers::%uuid of player%}
+
+# ------------------------------------------------------------------------------
+#  Gestion des clics dans le menu DL
+# ------------------------------------------------------------------------------
+
+on inventory click:
+    name of event-inventory is "{@me_gui_dl_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    set {_isright} to false
+    if click type is right mouse button:
+        set {_isright} to true
+
+    if {_slot} is 49:
+        # Retour au menu principal
+        meBuildMenu(player)
+        stop
+
+    # Pagination
+    if {_slot} is 45:
+        set {_cp} to {me_dl_menu_page::%uuid of player%}
+        if {_cp} is not set:
+            set {_cp} to 1
+        if {_cp} > 1:
+            set {me_dl_menu_page::%uuid of player%} to {_cp} - 1
+            meBuildDlMenu(player)
+        stop
+    if {_slot} is 53:
+        set {_cp} to {me_dl_menu_page::%uuid of player%}
+        if {_cp} is not set:
+            set {_cp} to 1
+        set {me_dl_menu_page::%uuid of player%} to {_cp} + 1
+        meBuildDlMenu(player)
+        stop
+
+    # Clic sur un DL actif (slots 9-17)
+    if {_slot} >= 9:
+        if {_slot} <= 17:
+            # Retrouver l'ID du DL a ce slot
+            set {_idx} to {_slot} - 8
+            set {_kill_id} to {me_dl::ids::%{_idx}%}
+            if {_kill_id} is not set:
+                stop
+            set {_kill_ip} to {me_dl::known::%{_kill_id}%::ip}
+            if {_isright} is true:
+                # Interrompre + restreindre 24h
+                set {_safe_ip} to {_kill_ip}
+                replace all "\042" with "" in {_safe_ip}
+                set {_safe_name} to name of player
+                replace all "\042" with "" in {_safe_name}
+                set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042,\042duration_seconds\042:86400,\042reason\042:\042admin GUI kill+restrict\042,\042by\042:\042%{_safe_name}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-restrict' 2>/dev/null"
+                meRunShell({_cmd})
+                send "{@me_prefix} &cInterrompu + IP &f%{_kill_ip}% &crestreinte pour 24h." to player
+                send "&6[Map] &cAdmin kill+restrict &7| &fid=&e%{_kill_id}% &fip=&b%{_kill_ip}% &8par &f%name of player%" to console
+            else:
+                # Interrompre seulement
+                meRunShell("curl -s -X POST 'http://localhost:8080/api/dl-cancel/%{_kill_id}%' 2>/dev/null")
+                send "{@me_prefix} &cInterruption envoyee pour id=&f%{_kill_id}% &c(ip=&f%{_kill_ip}%&c)." to player
+                send "&6[Map] &cAdmin kill &7| &fid=&e%{_kill_id}% &fip=&b%{_kill_ip}% &8par &f%name of player%" to console
+            wait 1 second
+            meBuildDlMenu(player)
+            stop
+
+    # Clic sur une personne (slots 27-44) : ouvre la vue détaillée
+    if {_slot} >= 27:
+        if {_slot} <= 44:
+            set {_pip} to {me_dl_menu_slotip::%uuid of player%::%{_slot}%}
+            if {_pip} is set:
+                meBuildPersonMenu(player, {_pip})
+                stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_dl_title}"
+    if {me_dl_replacing::%uuid of player%} is set:
+        # On est en plein rebuild par le poller : on ne wipe rien
+        stop
+    delete {me_dl_menu_viewers::%uuid of player%}
+    delete {me_dl_menu_slotip::%uuid of player%::*}
+    delete {me_dl_menu_page::%uuid of player%}
+    delete {me_dl_menu_total_pages::%uuid of player%}
+
+# ------------------------------------------------------------------------------
+#  Gestion des clics dans le menu Personne (historique détaillé)
+# ------------------------------------------------------------------------------
+
+on inventory click:
+    name of event-inventory is "{@me_gui_person_title}"
+    cancel event
+    if player does not have permission "xeinoria.mapexport":
+        close player's inventory
+        stop
+    set {_slot} to index of event-slot
+    set {_isright} to false
+    if click type is right mouse button:
+        set {_isright} to true
+    set {_uuid_c} to uuid of player
+    set {_ipc} to {me_person_menu_ip::%{_uuid_c}%}
+
+    if {_slot} is 49:
+        meBuildDlMenu(player)
+        stop
+
+    # --- Actions sur l'utilisateur (slots 13 / 15) ---
+    if {_slot} is 13:
+        # Interrompre le DL actif si present
+        set {_aid} to {me_person_active_id::%{_uuid_c}%}
+        if {_aid} is not set:
+            send "{@me_prefix} &7Aucun DL actif a interrompre pour cette IP." to player
+            stop
+        set {_aip} to {me_dl::known::%{_aid}%::ip}
+        meRunShell("curl -s -X POST 'http://localhost:8080/api/dl-cancel/%{_aid}%' 2>/dev/null")
+        send "{@me_prefix} &cInterruption envoyee pour id=&f%{_aid}% &c(ip=&f%{_aip}%&c)." to player
+        send "&6[Map] &cAdmin kill &7| &fid=&e%{_aid}% &fip=&b%{_aip}% &8par &f%name of player% &8(person GUI)" to console
+        wait 1 second
+        if {_ipc} is set:
+            meBuildPersonMenu(player, {_ipc})
+        stop
+
+    if {_slot} is 15:
+        if {_ipc} is not set:
+            stop
+        set {_safe_ip} to {_ipc}
+        replace all "\042" with "" in {_safe_ip}
+        set {_safe_name} to name of player
+        replace all "\042" with "" in {_safe_name}
+        # L'action depend de l'etat courant (affiche par le bouton lui-meme).
+        # Si IP restreinte => leve la restriction. Sinon => applique 24h.
+        if {me_restricted::set::%{_ipc}%} is set:
+            set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-unrestrict' 2>/dev/null"
+            meRunShell({_cmd})
+            delete {me_restricted::set::%{_ipc}%}
+            send "{@me_prefix} &aRestriction levee pour &f%{_ipc}%&a." to player
+            send "&6[Map] &aAdmin unrestrict &7| &fip=&b%{_ipc}% &8par &f%name of player% &8(person GUI)" to console
+        else:
+            set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042,\042duration_seconds\042:86400,\042reason\042:\042admin person GUI restrict\042,\042by\042:\042%{_safe_name}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-restrict' 2>/dev/null"
+            meRunShell({_cmd})
+            set {me_restricted::set::%{_ipc}%} to true
+            send "{@me_prefix} &cIP &f%{_ipc}% &crestreinte pour 24h." to player
+            send "&6[Map] &cAdmin restrict 24h &7| &fip=&b%{_ipc}% &8par &f%name of player% &8(person GUI)" to console
+        # Refresh live (sans rebuild complet) pour eviter le flicker.
+        set {_inv_p} to metadata value "me_person_inv" of player
+        if {_inv_p} is set:
+            meRefreshPersonLiveSlots(player, {_inv_p}, {_ipc})
+        stop
+
+    if {_slot} is 45:
+        set {_cp} to {me_person_menu_page::%uuid of player%}
+        if {_cp} is not set:
+            set {_cp} to 1
+        if {_cp} > 1:
+            set {me_person_menu_page::%uuid of player%} to {_cp} - 1
+            if {_ipc} is set:
+                meBuildPersonMenu(player, {_ipc})
+        stop
+    if {_slot} is 53:
+        set {_cp} to {me_person_menu_page::%uuid of player%}
+        if {_cp} is not set:
+            set {_cp} to 1
+        set {me_person_menu_page::%uuid of player%} to {_cp} + 1
+        if {_ipc} is set:
+            meBuildPersonMenu(player, {_ipc})
+        stop
+
+on inventory close:
+    name of event-inventory is "{@me_gui_person_title}"
+    if {me_person_replacing::%uuid of player%} is set:
+        stop
+    delete {me_person_menu_viewers::%uuid of player%}
+    delete {me_person_menu_page::%uuid of player%}
+    delete {me_person_menu_ip::%uuid of player%}
+    delete {me_person_skins::%uuid of player%::*}
+    delete {me_person_skins_count::%uuid of player%}
+    delete {me_person_skin_idx::%uuid of player%}
+    delete metadata value "me_person_inv" of player
+    delete metadata value "me_person_disp" of player
+    delete metadata value "me_person_pseudo" of player
+    delete metadata value "me_person_ip" of player
+    delete metadata value "me_person_ec" of player
+    delete metadata value "me_person_page" of player
+    delete metadata value "me_person_total" of player
+
+# Cycle de la skin du header (slot 4) toutes les 2 secondes quand plusieurs
+# pseudos sont associes a l'IP affichee. La fetch Mojang etant cachee, le
+# cout est nul apres le 1er affichage.
+every 2 seconds:
+    # Refresh global du cache restricted UNIQUEMENT si au moins un viewer
+    # du menu personne est actif (sinon, on evite le curl inutile).
+    set {_anyPerson} to false
+    loop all players:
+        if {me_person_menu_viewers::%uuid of loop-player%} is set:
+            set {_anyPerson} to true
+    if {_anyPerson} is true:
+        meRefreshRestrictedSet()
+    loop all players:
+        set {_uuid} to uuid of loop-player
+        # --- Menu DL : cycle skins de la grille personne (slots 27-44) ---
+        if {me_dl_menu_viewers::%{_uuid}%} is set:
+            if name of current inventory of loop-player is "{@me_gui_dl_title}":
+                set {_invd} to current inventory of loop-player
+                set {_nowts} to unix timestamp of now
+                set {_halfd} to floor({_nowts} / 2)
+                loop integers from 27 to 44:
+                    set {_sl} to loop-integer-2
+                    set {_pld} to {me_dl_menu_slot_pl::%{_uuid}%::%{_sl}%}
+                    if {_pld} is set:
+                        if {_pld} is not "":
+                            set {_pldn::*} to split {_pld} at "|"
+                            set {_pldc} to size of {_pldn::*}
+                            if {_pldc} > 1:
+                                set {_cidxd} to mod({_halfd}, {_pldc}) + 1
+                                set {_sknd} to {_pldn::%{_cidxd}%}
+                                set {_offd} to {_sknd} parsed as offline player
+                                if {_offd} is set:
+                                    set {_cur} to slot {_sl} of {_invd}
+                                    set {_newh} to skull of {_offd}
+                                    set name of {_newh} to name of {_cur}
+                                    set lore of {_newh} to lore of {_cur}
+                                    set slot {_sl} of {_invd} to {_newh}
+        # --- Menu personne : cycle skin du header (slot 4) + live slots ---
+        if {me_person_menu_viewers::%{_uuid}%} is set:
+            set {_inv2} to metadata value "me_person_inv" of loop-player
+            set {_ipm2} to metadata value "me_person_ip" of loop-player
+            # Refresh des slots vivants (11/13/15) a chaque tick.
+            if {_inv2} is set:
+                if {_ipm2} is set:
+                    meRefreshPersonLiveSlots(loop-player, {_inv2}, {_ipm2})
+                    # Refresh des events (18-44) + header (slot 4) : detecte
+                    # via signature les nouveaux logs apparus depuis l'ouverture.
+                    meRefreshPersonEvents(loop-player, {_inv2}, {_ipm2})
+            set {_n} to {me_person_skins_count::%{_uuid}%}
+            if {_n} is set:
+                if {_n} > 1:
+                    set {_idx} to {me_person_skin_idx::%{_uuid}%}
+                    if {_idx} is not set:
+                        set {_idx} to 1
+                    set {_idx} to {_idx} + 1
+                    if {_idx} > {_n}:
+                        set {_idx} to 1
+                    set {me_person_skin_idx::%{_uuid}%} to {_idx}
+                    set {_name} to {me_person_skins::%{_uuid}%::%{_idx}%} ? ""
+                    set {_inv2b} to metadata value "me_person_inv" of loop-player
+                    if {_inv2b} is set:
+                        set {_disp2} to metadata value "me_person_disp" of loop-player
+                        set {_ps2} to metadata value "me_person_pseudo" of loop-player
+                        set {_ipm2b} to metadata value "me_person_ip" of loop-player
+                        set {_ec2} to metadata value "me_person_ec" of loop-player
+                        set {_pg2} to metadata value "me_person_page" of loop-player
+                        set {_tp2} to metadata value "me_person_total" of loop-player
+                        set {_h} to meBuildPersonHead({_disp2}, {_pg2}, {_tp2}, {_ipm2b}, {_ps2}, {_ec2}, {_name})
+                        set slot 4 of {_inv2b} to {_h}
+
+# ==============================================================================
+#  Auto-whitelist admins (IP enregistree dans norath-web, TTL 7j cote serveur)
+# ==============================================================================
+
+function meRegisterAdminIp(p: player):
+    set {_ip} to ip of {_p}
+    replace "/" with "" in {_ip}
+    # Skip IPv6 (contient ":")
+    if {_ip} contains ":":
+        stop
+    if {_ip} is "":
+        stop
+    set {_name} to name of {_p}
+    set {_cmd} to "printf '{\042ip\042:\042%{_ip}%\042,\042name\042:\042%{_name}%\042}' | curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-admin-ip' >/dev/null 2>&1"
+    meRunShell({_cmd})
+
+on join:
+    if player has permission "xeinoria.mapexport":
+        wait 2 seconds
+        if player is online:
+            meRegisterAdminIp(player)
+
+# ==============================================================================
+#  Commande : /mapexport
+# ==============================================================================
+
+command /mapexport [<text>] [<text>] [<text>]:
+    description: Gere l'export public de la map survie (CC BY-NC-SA 4.0).
+    permission: xeinoria.mapexport
+    aliases: /me-export, /survieexport
+    trigger:
+        if arg-1 is not set:
+            if sender is a player:
+                meBuildMenu(player)
+                stop
+            send "{@me_prefix} &7Sous-commandes : run | status | list | versions | expose | delete | menu | enable | disable | prune | config | restrict | unrestrict | restricted" to sender
+            stop
+
+        set {_sub} to lowercase arg-1
+
+        if {_sub} is "menu":
+            if sender is not a player:
+                send "{@me_prefix} &cLe menu n'est utilisable qu'en jeu." to sender
+                stop
+            meBuildMenu(player)
+            stop
+
+        if {_sub} is "run":
+            if sender is a player:
+                set {me_export_player} to player
+            send "{@me_prefix} &aLancement de l'export en arriere-plan..." to sender
+            set {_out} to meTriggerExport()
+            send "{@me_prefix} &7%{_out}%" to sender
+            stop
+
+        if {_sub} is "cancel":
+            set {_cur_phase} to meReadProgress("phase")
+            if meIsActivePhase({_cur_phase}) is false:
+                send "{@me_prefix} &7Aucun export en cours." to sender
+                stop
+            meRunShell("{@me_script} cancel")
+            send "{@me_prefix} &cAnnulation envoyee. L'export s'arretera dans quelques secondes." to sender
+            stop
+
+        if {_sub} is "status":
+            set {_out} to meRunShell("{@me_script} status")
+            send "{@me_prefix} &7Etat :" to sender
+            loop split {_out} at newline:
+                send "  &f%loop-value%" to sender
+            stop
+
+        if {_sub} is "list":
+            set {_out} to meRunShell("{@me_script} list")
+            send "{@me_prefix} &7Versions :" to sender
+            loop split {_out} at newline:
+                send "  &f%loop-value%" to sender
+            stop
+
+        if {_sub} is "versions":
+            set {_out} to meRunShell("{@me_script} versions_list 2>/dev/null")
+            set {_lines::*} to split {_out} at newline
+            set {_anything} to false
+            send "{@me_prefix} &7Sauvegardes :" to sender
+            loop {_lines::*}:
+                if loop-value is not "":
+                    set {_anything} to true
+                    set {_tok::*} to split loop-value at "|"
+                    set {_marker} to "&7[cache]"
+                    if {_tok::5} is "1":
+                        set {_marker} to "&a[expose]"
+                    send "  %{_marker}% &f%{_tok::1}% &7| &f%{_tok::6}% &7| &f%{_tok::7}%" to sender
+            if {_anything} is false:
+                send "  &8(aucune sauvegarde)" to sender
+            stop
+
+        if {_sub} is "expose":
+            if arg-2 is not set:
+                send "{@me_prefix} &cUsage : /mapexport expose <fichier.zip>" to sender
+                send "{@me_prefix} &7Liste : &f/mapexport versions" to sender
+                stop
+            set {_safe_file} to arg-2
+            replace all "'" with "" in {_safe_file}
+            replace all "\042" with "" in {_safe_file}
+            replace all ";" with "" in {_safe_file}
+            replace all "&" with "" in {_safe_file}
+            replace all "|" with "" in {_safe_file}
+            replace all " " with "" in {_safe_file}
+            send "{@me_prefix} &7Exposition de &f%{_safe_file}% &7en cours..." to sender
+            set {_res} to meRunShell("{@me_script} set_latest '%{_safe_file}%' 2>&1")
+            if {_res} contains "ERREUR:":
+                send "{@me_prefix} &cEchec : %{_res}%" to sender
+            else:
+                send "{@me_prefix} &aSauvegarde exposee sur le site : &f%{_safe_file}%" to sender
+                if sender is a player:
+                    send "&6[Map] &aAdmin set_latest &7| &ffile=&b%{_safe_file}% &8par &f%name of sender%" to console
+                else:
+                    send "&6[Map] &aAdmin set_latest &7| &ffile=&b%{_safe_file}% &8par &fconsole" to console
+            stop
+
+        if {_sub} is "delete":
+            if arg-2 is not set:
+                send "{@me_prefix} &cUsage : /mapexport delete <fichier.zip> [confirm]" to sender
+                send "{@me_prefix} &7Liste : &f/mapexport versions" to sender
+                stop
+            set {_safe_file} to arg-2
+            replace all "'" with "" in {_safe_file}
+            replace all "\042" with "" in {_safe_file}
+            replace all ";" with "" in {_safe_file}
+            replace all "&" with "" in {_safe_file}
+            replace all "|" with "" in {_safe_file}
+            replace all " " with "" in {_safe_file}
+            if arg-3 is not "confirm":
+                send "{@me_prefix} &c&lAttention&r &7: cette commande va supprimer definitivement &f%{_safe_file}%&7." to sender
+                send "{@me_prefix} &7Pour confirmer : &f/mapexport delete %{_safe_file}% confirm" to sender
+                stop
+            send "{@me_prefix} &7Suppression de &f%{_safe_file}% &7en cours..." to sender
+            set {_res} to meRunShell("{@me_script} delete_version '%{_safe_file}%' 2>&1")
+            set {_err} to false
+            if {_res} contains "ERREUR:":
+                set {_err} to true
+            if {_err} is true:
+                send "{@me_prefix} &cEchec : %{_res}%" to sender
+            else:
+                send "{@me_prefix} &aSauvegarde supprimee : &f%{_safe_file}%" to sender
+                if sender is a player:
+                    send "&6[Map] &cAdmin delete_version &7| &ffile=&b%{_safe_file}% &8par &f%name of sender%" to console
+                else:
+                    send "&6[Map] &cAdmin delete_version &7| &ffile=&b%{_safe_file}% &8par &fconsole" to console
+            stop
+
+        if {_sub} is "downloads":
+            set {_active} to false
+            if {me_dl::count} is set:
+                if {me_dl::count} > 0:
+                    set {_active} to true
+            if {_active} is false:
+                send "{@me_prefix} &7Aucun telechargement actif." to sender
+            else:
+                send "{@me_prefix} &e%{me_dl::count}% telechargement(s) en cours :" to sender
+                loop {me_dl::lines::*}:
+                    send "  &7• %loop-value%" to sender
+            stop
+
+        if {_sub} is "enable":
+            meRunShell("{@me_script} enable")
+            send "{@me_prefix} &aTelechargement public ACTIVE." to sender
+            stop
+
+        if {_sub} is "disable":
+            meRunShell("{@me_script} disable")
+            send "{@me_prefix} &cTelechargement public DESACTIVE." to sender
+            stop
+
+        if {_sub} is "prune":
+            meRunShell("{@me_script} prune")
+            send "{@me_prefix} &7Prune termine." to sender
+            stop
+
+        if {_sub} is "restrict":
+            if arg-2 is not set:
+                send "{@me_prefix} &cUsage : /mapexport restrict <ip> [duree_secondes=86400] [motif...]" to sender
+                stop
+            set {_ip} to arg-2
+            if {_ip} does not match "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}":
+                send "{@me_prefix} &cIP invalide : &f%{_ip}%" to sender
+                stop
+            set {_dur} to 86400
+            if arg-3 is set:
+                set {_durparsed} to arg-3 parsed as integer
+                if {_durparsed} is not set:
+                    send "{@me_prefix} &cDuree invalide : &f%arg-3% &c(secondes attendues, 0 = permanent)" to sender
+                    stop
+                set {_dur} to {_durparsed}
+            set {_reason} to "admin command"
+            set {_by} to "console"
+            if sender is a player:
+                set {_by} to name of sender
+            # Build cmd
+            set {_safe_ip} to {_ip}
+            replace all "\042" with "" in {_safe_ip}
+            set {_safe_by} to {_by}
+            replace all "\042" with "" in {_safe_by}
+            set {_safe_reason} to {_reason}
+            replace all "\042" with "" in {_safe_reason}
+            set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042,\042duration_seconds\042:%{_dur}%,\042reason\042:\042%{_safe_reason}%\042,\042by\042:\042%{_safe_by}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-restrict' 2>/dev/null"
+            set {_out} to meRunShell({_cmd})
+            if {_dur} is 0:
+                send "{@me_prefix} &cIP &f%{_ip}% &crestreinte de maniere permanente." to sender
+            else:
+                send "{@me_prefix} &cIP &f%{_ip}% &crestreinte pour &f%{_dur}% &csecondes." to sender
+            stop
+
+        if {_sub} is "unrestrict":
+            if arg-2 is not set:
+                send "{@me_prefix} &cUsage : /mapexport unrestrict <ip>" to sender
+                stop
+            set {_ip} to arg-2
+            if {_ip} does not match "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}":
+                send "{@me_prefix} &cIP invalide : &f%{_ip}%" to sender
+                stop
+            set {_safe_ip} to {_ip}
+            replace all "\042" with "" in {_safe_ip}
+            set {_cmd} to "printf '{\042ip\042:\042%{_safe_ip}%\042}' | curl -s --max-time 3 -X POST -H 'Content-Type: application/json' --data-binary @- 'http://localhost:8080/api/dl-unrestrict' 2>/dev/null"
+            meRunShell({_cmd})
+            send "{@me_prefix} &aRestriction levee pour &f%{_ip}%&a." to sender
+            stop
+
+        if {_sub} is "restricted":
+            set {_out} to meRunShell("curl -s --max-time 2 'http://localhost:8080/api/dl-restricted?fmt=pipe' 2>/dev/null")
+            replace all newline with "" in {_out}
+            set {_parts::*} to split {_out} at "|"
+            set {_n} to ({_parts::1} ? "0") parsed as integer
+            if {_n} is not set:
+                set {_n} to 0
+            if {_n} <= 0:
+                send "{@me_prefix} &7Aucune IP restreinte." to sender
+                stop
+            send "{@me_prefix} &e%{_n}% IP restreinte(s) :" to sender
+            loop {_n} times:
+                set {_idx} to loop-value + 1
+                set {_entry} to {_parts::%{_idx}%}
+                if {_entry} is set:
+                    set {_tok::*} to split {_entry} at "~"
+                    set {_ip} to {_tok::1}
+                    set {_until_ms} to {_tok::2} parsed as number
+                    set {_reason} to {_tok::4}
+                    set {_by} to {_tok::5}
+                    set {_until_disp} to "&cpermanente"
+                    if {_until_ms} is set:
+                        if {_until_ms} > 0:
+                            set {_until_epoch} to floor({_until_ms} / 1000)
+                            set {_until_disp} to meRunShell("date -d @%{_until_epoch}% '+%%d/%%m/%%Y %%H:%%M' 2>/dev/null")
+                            replace all newline with "" in {_until_disp}
+                    send "  &7• &f%{_ip}% &7jusqu'au &f%{_until_disp}% &8(%{_reason}% / par %{_by}%)" to sender
+            stop
+
+        if {_sub} is "config":
+            if arg-2 is not set:
+                set {_out} to meRunShell("{@me_script} config dump")
+                send "{@me_prefix} &7Config :" to sender
+                loop split {_out} at newline:
+                    send "  &f%loop-value%" to sender
+                stop
+            if lowercase arg-2 is "get":
+                if arg-3 is not set:
+                    send "{@me_prefix} &cUsage : /mapexport config get <key>" to sender
+                    stop
+                # Securite: la cle est passee a un shell via meRunShell.
+                # On limite strictement aux caracteres alphanumeriques + underscore.
+                set {_key} to lowercase arg-3
+                if {_key} does not match "[a-z0-9_]+":
+                    send "{@me_prefix} &cCle invalide. Caracteres autorises : a-z, 0-9, _" to sender
+                    stop
+                set {_out} to meCfgGet({_key})
+                send "{@me_prefix} &7%{_key}% = &f%{_out}%" to sender
+                stop
+            if lowercase arg-2 is "set":
+                send "{@me_prefix} &cUtilise le menu : /mapexport menu" to sender
+                stop
+            send "{@me_prefix} &cSous-commande config inconnue." to sender
+            stop
+
+        send "{@me_prefix} &cSous-commande inconnue. Tape /mapexport sans argument (ouvre le menu)." to sender
+
+# ==============================================================================
+#  Notes
+# ==============================================================================
+# - Permission xeinoria.mapexport requise. A accorder via LuckPerms aux op/staff.
+# - Le bash export_map.sh est appele en sous-processus, sans privilege root.
+# - La frequence auto est respectee par cron_tick (cron quotidien 02:30).

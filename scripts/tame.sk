@@ -1,0 +1,84 @@
+command /entityadmin <text> [<player>]:
+    permission: entity.admin
+    permission message: §cTu n'as pas le droit de faire ça.
+    usage: /entityadmin <set|remove|info|sit|stand|heal|target|clear> [joueur]
+    trigger:
+        set {_target} to target entity
+        if {_target} is not set:
+            send "§c[Admin] §7Tu dois regarder une entité." to player
+            stop
+            
+        if arg-1 is "info":
+            if owner of {_target} is set:
+                send "§b[Admin] §7Propriétaire : §e%owner of {_target}%" to player
+            else:
+                send "§b[Admin] §7Cette entité n'a §aucun propriétaire§7." to player
+
+        else if arg-1 is "set":
+            if arg-2 is set:
+                execute console command "data modify entity %uuid of {_target}% Owner set from entity %uuid of arg-2% UUID"
+                send "§b[Admin] §7L'entité appartient désormais à §a%arg-2%§7." to player
+            else:
+                send "§c[Admin] §7Précise un joueur !" to player
+
+        else if arg-1 is "remove" or "del":
+            execute console command "data remove entity %uuid of {_target}% Owner"
+            send "§b[Admin] §7Le propriétaire a été §csupprimé§7." to player
+
+        else if arg-1 is "sit":
+            add nbt compound from "{Sitting:1b}" to nbt of {_target}
+            send "§b[Admin] §7L'entité est maintenant §6assise§7." to player
+            delete target of {_target}
+
+        else if arg-1 is "stand" or "up":
+            add nbt compound from "{Sitting:0b}" to nbt of {_target}
+            send "§b[Admin] §7L'entité est maintenant §6debout§7." to player
+
+        # --- NOUVELLES OPTIONS : HEAL, TARGET, CLEAR ---
+
+        else if arg-1 is "heal":
+            # Soigne l'entité au maximum de sa vie
+            heal {_target}
+            send "§b[Admin] §7L'entité a été §aentièrement soignée§7." to player
+
+        else if arg-1 is "target":
+            if arg-2 is set:
+                # Définit la cible agressive sur le joueur cité
+                set target of {_target} to arg-2
+                # Force l'agressivité visuelle (yeux rouges) via NBT 1.21.1
+                add nbt compound from "{Angry:1b,anger_end_time:999999L}" to nbt of {_target}
+                send "§b[Admin] §7L'entité attaque maintenant §c%arg-2%§7." to player
+            else:
+                send "§c[Admin] §7Précise un joueur à attaquer !" to player
+
+        else if arg-1 is "clear" or "forget":
+            # 1. On vide la cible logique
+            delete target of {_target}
+            
+            # 2. Reset profond du NBT (on retire tout souvenir de combat)
+            set {_nbt} to nbt compound of {_target}
+            delete tag "angry_at" of {_nbt}
+            delete tag "anger_end_time" of {_nbt}
+            delete tag "HurtByTimestamp" of {_nbt}
+            delete tag "Brain;memories;minecraft:attack_target" of {_nbt}
+            delete tag "Brain;memories;minecraft:angry_at" of {_nbt}
+            
+            # On injecte le calme plat et on force la fin de l'amour/colère
+            set {_reset} to nbt compound from "{Angry:0b,AngerTime:0,InLove:0,HurtTime:0s}"
+            add {_reset} to {_nbt}
+            add {_nbt} to nbt of {_target}
+
+            # 3. LE FIX ULTIME : On ré-apprivoise l'animal pour purger les listes d'amis/ennemis
+            set {_owner} to owner of target entity
+            if {_owner} is set:
+                # On désapprivoise
+                execute console command "data remove entity %uuid of {_target}% Owner"
+                wait 1 tick
+                # On ré-apprivoise au même propriétaire
+                execute console command "data modify entity %uuid of {_target}% Owner set from entity %uuid of {_owner}% UUID"
+            
+            send "§b[Admin] §7Reset total effectué. L'animal a oublié ses ennemis." to player
+
+        else:
+            send "§c[Admin] §7Usage: /entityadmin <set|remove|info|sit|stand|heal|target|clear>" to player
+

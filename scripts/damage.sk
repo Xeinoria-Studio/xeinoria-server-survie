@@ -1,0 +1,5 @@
+on damage of player:
+    attacker is a player
+    if attacker's tool is a mace:
+        set {_dmg} to damage
+        send "&cTu as infligé &e%{_dmg}% &cdégâts à &6%victim%" to attacker

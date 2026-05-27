@@ -1,0 +1,23 @@
+command /tprespawn [<offline player>]:
+    permission: op
+    description: Se téléporter au point de respawn d'un joueur spécifique
+    usage: /tprespawn <nom_du_joueur>
+    trigger:
+        # Si un argument est donné, on l'utilise. Sinon, on prend le joueur visé.
+        set {_target} to arg-1
+        if {_target} is not set:
+            set {_target} to target player
+
+        # Vérification si on a trouvé un joueur
+        if {_target} is not set:
+            send "&cErreur : Veuillez spécifier un nom de joueur ou en viser un." to player
+            stop
+
+        # On récupère le point de respawn (lit ou ancre)
+        set {_respawn} to {_target}'s bed location
+
+        if {_respawn} is set:
+            teleport player to {_respawn}
+            send "&aTP au point de respawn de &e%{_target}% &aeffectuée." to player
+        else:
+            send "&c%{_target}% n'a pas de point de respawn défini (lit ou ancre manquante)." to player

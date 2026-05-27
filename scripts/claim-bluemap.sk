@@ -1,0 +1,313 @@
+# ============================================================
+#  Norath — Integration BlueMap des claims
+#  ------------------------------------------------------------
+#  Publie chaque claim sous forme de ExtrudeMarker (volume 3D)
+#  sur toutes les maps BlueMap du monde concerne, via skript-reflect.
+#
+#  Tout est encapsule en fonctions bm*. Si le plugin BlueMap n'est
+#  pas installe / pas active, toutes les fonctions deviennent des
+#  no-op : aucun crash, aucun warning.
+#
+#  Doc API BlueMap : https://bluemap.bluecolored.de/wiki/customization/Markers.html
+# ============================================================
+
+import:
+    org.bukkit.Bukkit
+    java.util.ArrayList
+    java.lang.Class
+    java.lang.Double
+    de.bluecolored.bluemap.api.BlueMapAPI
+    de.bluecolored.bluemap.api.markers.MarkerSet
+    de.bluecolored.bluemap.api.markers.ExtrudeMarker
+    de.bluecolored.bluemap.api.math.Shape
+    de.bluecolored.bluemap.api.math.Color
+
+options:
+    bm_enabled: yes                   # master switch (yes/no, evite warning Skript)
+    bm_set_id: norath_claims          # id du marker-set "joueurs"
+    bm_set_id_admin: norath_zones     # id du marker-set "admin"
+    bm_set_label: Claims des joueurs
+    bm_set_label_admin: Zones administratives
+    bm_line_width: 3
+    bm_default_min_y: -64
+    bm_default_max_y: 320
+    # Couleurs : RGB en 0-255, alpha en FLOAT 0.0-1.0 (API BlueMap).
+    # Fill tres transparent pour laisser voir la map ; contour bien marque.
+    bm_player_fill_r: 0
+    bm_player_fill_g: 180
+    bm_player_fill_b: 255
+    bm_player_fill_a: 0.18
+    bm_player_line_r: 0
+    bm_player_line_g: 180
+    bm_player_line_b: 255
+    bm_player_line_a: 0.95
+    bm_admin_fill_r: 255
+    bm_admin_fill_g: 80
+    bm_admin_fill_b: 80
+    bm_admin_fill_a: 0.15
+    bm_admin_line_r: 255
+    bm_admin_line_g: 80
+    bm_admin_line_b: 80
+    bm_admin_line_a: 0.95
+    # Initialisation : retente jusqu'a ce que BlueMap soit pret.
+    bm_init_retry: 4 seconds
+    bm_init_max_attempts: 60
+    # Debug console (laisser "no" en prod).
+    bm_debug: no
+
+# ============================================================
+#  Helpers internes
+# ============================================================
+
+function bmDebug(msg: text):
+    set {_d} to "{@bm_debug}"
+    if {_d} is "yes":
+        send "[bm-claim] %{_msg}%" to console
+
+function bmEnabled() :: boolean:
+    set {_e} to "{@bm_enabled}"
+    if {_e} is not "yes":
+        return false
+    if plugin "BlueMap" is not enabled:
+        return false
+    return true
+
+# Cache (lazy) du constructeur Vector2d : la classe est dans la lib
+# externe flow-math, pas visible du classloader Skript. On la recupere
+# via le classloader de BlueMap.
+function bmVec2dCtor() :: object:
+    if {bm::vec_ctor} is set:
+        return {bm::vec_ctor}
+    set {_cl} to BlueMapAPI.class.getClassLoader()
+    set {_cls} to Class.forName("com.flowpowered.math.vector.Vector2d", true, {_cl})
+    set {bm::vec_ctor} to {_cls}.getConstructor(Double.TYPE, Double.TYPE)
+    return {bm::vec_ctor}
+
+function bmVec2d(x: number, z: number) :: object:
+    return bmVec2dCtor().newInstance({_x}, {_z})
+
+# Renvoie l'instance API ou rien.
+function bmApi() :: object:
+    if bmEnabled() is false:
+        return {_unset}
+    set {_opt} to BlueMapAPI.getInstance()
+    if {_opt}.isPresent() is false:
+        return {_unset}
+    return {_opt}.get()
+
+# Id stable d'un marker pour un claim.
+function bmMarkerId(id: integer) :: text:
+    return "claim_%{_id}%"
+
+# Cree / recupere le MarkerSet sur une map donnee.
+function bmEnsureSet(map: object, setId: text, setLabel: text) :: object:
+    set {_sets} to {_map}.getMarkerSets()
+    if {_sets}.containsKey({_setId}) is true:
+        return {_sets}.get({_setId})
+    set {_set} to MarkerSet.builder().label({_setLabel}).toggleable(true).defaultHidden(false).build()
+    {_sets}.put({_setId}, {_set})
+    bmDebug("create marker-set ""%{_setId}%"" on map %{_map}.getId()%")
+    return {_set}
+
+# Construit le Shape XZ d'un claim (rect ou poly).
+function bmShapeOf(id: integer) :: object:
+    if claimMode({_id}) is "rect":
+        set {_a} to {claim::data::%{_id}%::rect::1}
+        set {_b} to {claim::data::%{_id}%::rect::2}
+        if {_a} is not set:
+            return {_unset}
+        if {_b} is not set:
+            return {_unset}
+        set {_x1} to x-coordinate of {_a}
+        set {_z1} to z-coordinate of {_a}
+        set {_x2} to x-coordinate of {_b}
+        set {_z2} to z-coordinate of {_b}
+        set {_minX} to min({_x1}, {_x2})
+        set {_maxX} to max({_x1}, {_x2}) + 1
+        set {_minZ} to min({_z1}, {_z2})
+        set {_maxZ} to max({_z1}, {_z2}) + 1
+        return Shape.createRect({_minX}, {_minZ}, {_maxX}, {_maxZ})
+    # poly
+    set {_n} to {claim::data::%{_id}%::poly::count} ? 0
+    if {_n} < 3:
+        return {_unset}
+    set {_pts} to new ArrayList()
+    set {_i} to 1
+    while {_i} <= {_n}:
+        set {_v} to {claim::data::%{_id}%::poly::%{_i}%}
+        if {_v} is set:
+            {_pts}.add(bmVec2d(x-coordinate of {_v}, z-coordinate of {_v}))
+        add 1 to {_i}
+    if {_pts}.size() < 3:
+        return {_unset}
+    return new Shape({_pts})
+
+# Bornes Y a utiliser pour l'extrusion (renvoie une liste {_::1, _::2}).
+function bmYBounds(id: integer) :: numbers:
+    if claimUseY({_id}) is true:
+        set {_minY} to {claim::data::%{_id}%::bbox::minY} ? {@bm_default_min_y}
+        set {_maxY} to ({claim::data::%{_id}%::bbox::maxY} ? {@bm_default_max_y}) + 1
+    else:
+        set {_minY} to {@bm_default_min_y}
+        set {_maxY} to {@bm_default_max_y}
+    return ({_minY} and {_maxY})
+
+# Construit le HTML "detail" affiche au survol/clic.
+function bmDetailHtml(id: integer) :: text:
+    set {_name} to claimDisplayName({_id})
+    set {_owner} to claimOwnerName({_id})
+    set {_area} to claimAreaOf({_id})
+    set {_sub} to claimSubtitle({_id})
+    set {_html} to "<div style=""font-weight:700;font-size:1.1em;margin-bottom:2px"">%{_name}%</div>"
+    if {_sub} is not "":
+        set {_html} to "%{_html}%<div style=""opacity:0.8;font-style:italic"">%{_sub}%</div>"
+    if claimIsAdminZone({_id}) is true:
+        set {_html} to "%{_html}%<div>Zone administrative</div>"
+    else:
+        set {_html} to "%{_html}%<div>Proprietaire : <b>%{_owner}%</b></div>"
+    set {_html} to "%{_html}%<div style=""opacity:0.6;font-size:0.9em"">id #%{_id}% &middot; %{_area}% blocs</div>"
+    return {_html}
+
+# ============================================================
+#  Operations publiques (no-op si BlueMap absent)
+# ============================================================
+
+# Cree/maj le marker du claim sur toutes les maps de son monde.
+function bmUpsertClaim(id: integer):
+    set {_api} to bmApi()
+    if {_api} is not set:
+        stop
+    if claimExists({_id}) is false:
+        bmRemoveClaim({_id})
+        stop
+    set {_w} to claimWorld({_id})
+    if {_w} is not set:
+        bmDebug("upsert #%{_id}%: world inconnu cote Bukkit")
+        stop
+    set {_wopt} to {_api}.getWorld({_w})
+    if {_wopt}.isPresent() is false:
+        bmDebug("upsert #%{_id}%: world non gere par BlueMap")
+        stop
+    set {_bmw} to {_wopt}.get()
+    set {_shape} to bmShapeOf({_id})
+    if {_shape} is not set:
+        bmDebug("upsert #%{_id}%: shape vide")
+        stop
+    if claimUseY({_id}) is true:
+        set {_minY} to {claim::data::%{_id}%::bbox::minY} ? {@bm_default_min_y}
+        set {_maxY} to ({claim::data::%{_id}%::bbox::maxY} ? {@bm_default_max_y}) + 1
+    else:
+        set {_minY} to {@bm_default_min_y}
+        set {_maxY} to {@bm_default_max_y}
+    set {_label} to claimDisplayName({_id})
+    set {_detail} to bmDetailHtml({_id})
+    if claimIsAdminZone({_id}) is true:
+        set {_fill} to new Color({@bm_admin_fill_r}, {@bm_admin_fill_g}, {@bm_admin_fill_b}, {@bm_admin_fill_a})
+        set {_line} to new Color({@bm_admin_line_r}, {@bm_admin_line_g}, {@bm_admin_line_b}, {@bm_admin_line_a})
+        set {_setId} to "{@bm_set_id_admin}"
+        set {_setLabel} to "{@bm_set_label_admin}"
+    else:
+        set {_fill} to new Color({@bm_player_fill_r}, {@bm_player_fill_g}, {@bm_player_fill_b}, {@bm_player_fill_a})
+        set {_line} to new Color({@bm_player_line_r}, {@bm_player_line_g}, {@bm_player_line_b}, {@bm_player_line_a})
+        set {_setId} to "{@bm_set_id}"
+        set {_setLabel} to "{@bm_set_label}"
+    set {_marker} to ExtrudeMarker.builder().label({_label}).detail({_detail}).shape({_shape}, {_minY}, {_maxY}).fillColor({_fill}).lineColor({_line}).lineWidth({@bm_line_width}).depthTestEnabled(false).build()
+    set {_mid} to bmMarkerId({_id})
+    set {_it} to {_bmw}.getMaps().iterator()
+    while {_it}.hasNext() is true:
+        set {_map} to {_it}.next()
+        set {_set} to bmEnsureSet({_map}, {_setId}, {_setLabel})
+        {_set}.put({_mid}, {_marker})
+    bmDebug("upsert claim #%{_id}% (%{_label}%) -> %{_setId}%")
+
+function bmRemoveClaim(id: integer):
+    set {_api} to bmApi()
+    if {_api} is not set:
+        stop
+    set {_mid} to bmMarkerId({_id})
+    set {_wit} to {_api}.getWorlds().iterator()
+    while {_wit}.hasNext() is true:
+        set {_world} to {_wit}.next()
+        set {_mit} to {_world}.getMaps().iterator()
+        while {_mit}.hasNext() is true:
+            set {_map} to {_mit}.next()
+            set {_sit} to {_map}.getMarkerSets().values().iterator()
+            while {_sit}.hasNext() is true:
+                set {_ms} to {_sit}.next()
+                {_ms}.remove({_mid})
+    bmDebug("remove claim #%{_id}%")
+
+# Re-publie tous les claims (init / reload manuel).
+function bmRefreshAll() :: integer:
+    set {_api} to bmApi()
+    if {_api} is not set:
+        return 0
+    set {_max} to {claim::id::counter} ? 0
+    set {_i} to 1
+    set {_n} to 0
+    while {_i} <= {_max}:
+        if claimExists({_i}) is true:
+            bmUpsertClaim({_i})
+            add 1 to {_n}
+        add 1 to {_i}
+    send "[bm-claim] %{_n}% claim(s) publie(s) sur BlueMap." to console
+    return {_n}
+
+# ============================================================
+#  Initialisation (retries) + commande admin
+# ============================================================
+
+function bmInit(attempt: integer):
+    set {_e} to "{@bm_enabled}"
+    if {_e} is not "yes":
+        bmDebug("init: integration desactivee (option bm_enabled=no)")
+        stop
+    if plugin "BlueMap" is not enabled:
+        if {_attempt} = 1:
+            send "[bm-claim] BlueMap absent : integration desactivee." to console
+        stop
+    set {_api} to bmApi()
+    if {_api} is set:
+        send "[bm-claim] BlueMap pret (tentative %{_attempt}%), publication des claims..." to console
+        bmRefreshAll()
+        stop
+    if {_attempt} >= {@bm_init_max_attempts}:
+        send "[bm-claim] BlueMap toujours pas pret apres %{_attempt}% tentatives. Abandon." to console
+        stop
+    bmDebug("init: API pas prete, retry #%{_attempt}% dans {@bm_init_retry}")
+    wait {@bm_init_retry}
+    bmInit({_attempt} + 1)
+
+on load:
+    wait 2 seconds
+    bmInit(1)
+
+command /claimbluemap [<text>]:
+    permission: skript.claim.bluemap
+    permission message: &cPermission requise.
+    trigger:
+        if arg 1 is not set:
+            send "&7Usage: &f/claimbluemap refresh|status" to sender
+            stop
+        if arg 1 is "refresh":
+            if bmEnabled() is false:
+                send "&cBlueMap non disponible (plugin absent ou option desactivee)." to sender
+                stop
+            set {_n} to bmRefreshAll()
+            send "&a%{_n}% claim(s) re-publie(s) sur BlueMap." to sender
+            stop
+        if arg 1 is "status":
+            if plugin "BlueMap" is enabled:
+                set {_pl} to "&aoui"
+            else:
+                set {_pl} to "&cnon"
+            set {_api} to bmApi()
+            if {_api} is set:
+                set {_ready} to "&aoui"
+            else:
+                set {_ready} to "&cnon"
+            send "&7BlueMap plugin enabled: %{_pl}%" to sender
+            send "&7Option bm_enabled: &f{@bm_enabled}" to sender
+            send "&7API ready: %{_ready}%" to sender
+            stop
+        send "&7Usage: &f/claimbluemap refresh|status" to sender

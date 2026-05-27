@@ -1,0 +1,37 @@
+command /tapetamouche [<text=give>]:
+    aliases: tapet, tapetteamouche, tapette
+    permission: admin
+    trigger:
+        sender is a player
+        arg-1 is "give":
+            player doesn't have permission "admin":
+                send "&cVous n'avez pas la permission d'utiliser cette commande." to player
+                stop
+            give player 1 brush of sharpness 1000 named "&7&k!&r &6Tapette à mouche &7&k!" with lore "&bMODE: &6TAPETTTTTT" and "&7Sera sûrement utilisé à tort et à travers car Norath est un débilus :P"
+            send "&aVous avez reçu la &6Tapette à mouche &a!" to player
+
+on click:
+    player is holding a brush named "&7&k!&r &6Tapette à mouche &7&k!"
+    player is not sneaking
+    distance between player and target is less than 5
+    cancel event
+    tapethit(player, target)
+    
+	
+on damage:
+    attacker is holding a brush named "&7&k!&r &6Tapette à mouche &7&k!"
+    distance between attacker and victim is less than 5
+    cancel event
+    tapethit(attacker, victim)
+
+function tapethit(p: player, e: entity):
+    {_e} is not online:
+        play sound "minecraft:entity.player.attack.sweep" with volume 100 with pitch 1 to {_p}
+        stop
+    play sound "minecraft:entity.player.attack.sweep" with volume 100 with pitch 1 to {_p}
+    push {_e} in direction of {_p} at speed 0.5
+    push {_e} upwards at speed 0.5
+    wait 0.2 seconds
+    kill {_e}
+
+    

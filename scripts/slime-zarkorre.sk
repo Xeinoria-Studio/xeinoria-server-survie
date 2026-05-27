@@ -1,0 +1,215 @@
+#!===============================================================================
+#! Slime-Zarkorre
+#!===============================================================================
+#! Cible : zarkorre uniquement (serveur survie).
+#! - Jump Boost I permanent
+#! - Son + particules slime au saut
+#! - Slowness I si pas de saut pendant 1 minute
+#!   (ignore si bottes avec Feather Falling)
+#! - A la mort : invoque plusieurs petits slimes temporaires
+#!   (pas de drop/xp, disparition au bout d'une minute)
+#! - Quand il prend des degats : son slime + particules (80% de chance)
+#!===============================================================================
+
+options:
+    target-name: zarkorre
+    upkeep-period: 5 seconds
+    jump-window: 1 minute
+    particle-view-radius: 24
+    slime-food-gain: 1
+    slime-saturation-gain: 0.4
+    slime-consume-seconds: 1.6 seconds
+    minion-count: 6
+    minion-lifetime: 1 minute
+
+function zarkorreIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function zarkorreIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function zarkorreHasFeatherFalling(p: player) :: boolean:
+    set {_boots} to boots of {_p}
+    if {_boots} is air:
+        return false
+    if {_boots} is enchanted with feather falling:
+        return true
+    return false
+
+function zarkorreSlimeFx(p: player, particleChance: number):
+    play sound "entity.slime.jump" with volume 1 and pitch 1.1 at {_p}
+    if random integer between 1 and 100 <= {_particleChance}:
+        loop all players in radius {@particle-view-radius} around {_p}:
+            show 18 "slime" particles at location of {_p} for loop-player
+
+function zarkorreMarkJump(p: player):
+    set {zarkorre.lastjump::%uuid of {_p}%} to now
+
+function zarkorreEnsureLastJump(p: player):
+    set {_id} to "%uuid of {_p}%"
+    if {zarkorre.lastjump::%{_id}%} is not set:
+        set {zarkorre.lastjump::%{_id}%} to now
+
+function zarkorreApplyJumpBoost(p: player):
+    apply potion effect of jump boost of tier 1 to {_p} for 15 seconds:
+        hide the particles
+        hide the icon
+
+function zarkorreApplyInactivitySlow(p: player):
+    apply potion effect of slowness of tier 1 to {_p} for 15 seconds:
+        hide the particles
+        hide the icon
+
+function zarkorreRemoveInactivitySlow(p: player):
+    remove slowness from {_p}
+
+function zarkorreDisableAll(p: player):
+    remove jump boost from {_p}
+    zarkorreRemoveInactivitySlow({_p})
+
+function zarkorreApplyEdibleSlimeBall(p: player):
+    if held item of {_p} is not slime ball:
+        stop
+    apply food component to held item of {_p}:
+        nutrition: {@slime-food-gain}
+        saturation: {@slime-saturation-gain}
+        can_always_eat: false
+    apply consumable component to held item of {_p}:
+        consume_seconds: {@slime-consume-seconds}
+        animation: "eat"
+        sound: "entity.slime.squish"
+        has_consume_particles: true
+
+function zarkorreShouldApplySlowness(p: player) :: boolean:
+    if zarkorreHasFeatherFalling({_p}) is true:
+        return false
+    set {_id} to "%uuid of {_p}%"
+    if difference between now and {zarkorre.lastjump::%{_id}%} >= {@jump-window}:
+        return true
+    return false
+
+function zarkorreSpawnMinions(loc: location):
+    loop {@minion-count} times:
+        summon slime at {_loc}
+        set {_s} to last spawned entity
+        # Doc Skript: pour un slime, entity size 0 = plus petite taille
+        set entity size of {_s} to 0
+        set {_sid} to "%uuid of {_s}%"
+        set {zarkorre.minion::%{_sid}%} to true
+        set {zarkorre.minion.expire::%{_sid}%} to now + {@minion-lifetime}
+
+function zarkorreCleanupMinions():
+    loop all slimes in all worlds:
+        set {_sid} to "%uuid of loop-entity%"
+        if {zarkorre.minion.expire::%{_sid}%} is set:
+            if now >= {zarkorre.minion.expire::%{_sid}%}:
+                kill loop-entity
+                delete {zarkorre.minion.expire::%{_sid}%}
+                delete {zarkorre.minion::%{_sid}%}
+
+on join:
+    if zarkorreIsTarget(player) is true:
+        if zarkorreIsInactive(player) is true:
+            zarkorreDisableAll(player)
+            stop
+        zarkorreMarkJump(player)
+        zarkorreRemoveInactivitySlow(player)
+        zarkorreApplyEdibleSlimeBall(player)
+
+every {@upkeep-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is not online:
+        stop
+    if zarkorreIsInactive({_p}) is true:
+        zarkorreDisableAll({_p})
+        stop
+
+    zarkorreEnsureLastJump({_p})
+    zarkorreApplyJumpBoost({_p})
+
+    if zarkorreShouldApplySlowness({_p}) is true:
+        zarkorreApplyInactivitySlow({_p})
+    else:
+        zarkorreRemoveInactivitySlow({_p})
+
+    zarkorreApplyEdibleSlimeBall({_p})
+
+    zarkorreCleanupMinions()
+
+on jump:
+    if zarkorreIsTarget(player) is false:
+        stop
+    if zarkorreIsInactive(player) is true:
+        stop
+
+    zarkorreMarkJump(player)
+    zarkorreRemoveInactivitySlow(player)
+    zarkorreSlimeFx(player, 100)
+
+on damage of player:
+    if zarkorreIsTarget(victim) is false:
+        stop
+    if zarkorreIsInactive(victim) is true:
+        stop
+
+    # Petit bonus "slime": amortit un peu les degats de chute
+    if damage cause is fall:
+        set damage to damage * 0.65
+
+    zarkorreSlimeFx(victim, 80)
+
+on death of player:
+    if zarkorreIsTarget(victim) is false:
+        stop
+    if zarkorreIsInactive(victim) is true:
+        stop
+
+    zarkorreRemoveInactivitySlow(victim)
+    zarkorreSpawnMinions(location of victim)
+
+on death of slime:
+    set {_sid} to "%uuid of victim%"
+    if {zarkorre.minion::%{_sid}%} is not set:
+        stop
+
+    clear drops
+    delete {zarkorre.minion::%{_sid}%}
+    delete {zarkorre.minion.expire::%{_sid}%}
+
+on held item change:
+    if zarkorreIsTarget(player) is true:
+        if zarkorreIsInactive(player) is true:
+            stop
+        zarkorreApplyEdibleSlimeBall(player)
+
+on drop:
+    if zarkorreIsTarget(player) is false:
+        stop
+    if zarkorreIsInactive(player) is true:
+        stop
+    if event-item is not slime ball:
+        stop
+    clear consumable item component of event-item
+    clear food item component of event-item
+
+on consume:
+    if consumed item is not slime ball:
+        stop
+    if zarkorreIsInactive(player) is true:
+        cancel event
+        stop
+    if zarkorreIsTarget(player) is true:
+        zarkorreSlimeFx(player, 100)
+        stop
+    cancel event

@@ -1,0 +1,332 @@
+#!===============================================================================
+#! Zombie-Norath
+#!===============================================================================
+#! Cible : Norath1211 (uniquement, sur le serveur survie).
+#! Comportement zombie face au soleil :
+#!   - de jour
+#!   - sans casque
+#!   - expose a la lumiere du ciel (sky light)
+#!   - pas dans l'eau
+#!   - pas sous la pluie / orage
+#!   => prend feu.
+#!===============================================================================
+
+import:
+    org.bukkit.event.entity.EntityResurrectEvent
+
+options:
+    target-name: Norath1211
+    check-period: 2 seconds
+    burn-duration: 6 seconds
+    min-skylight: 12
+    instant-heal-damage-multiplier: 1
+    instant-harm-heal-multiplier: 1
+    potion-kb-up-speed: 0.09
+    drink-harming-window: 2 seconds
+    totem-heal-bypass-window: 3 seconds
+
+every {@check-period}:
+    zombieNorathTick()
+
+# Boucle principale.
+function zombieNorathTick():
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is not online:
+        stop
+    if zombieNorathIsInactive({_p}) is true:
+        stop
+    if zombieNorathShouldBurn({_p}) is true:
+        ignite {_p} for {@burn-duration}
+        send action bar "§cLe soleil brûle ta peau !" to {_p}
+
+# Toutes les conditions reunies pour cramer.
+function zombieNorathShouldBurn(p: player) :: boolean:
+    if zombieNorathIsOverworld({_p}) is false:
+        return false
+    if zombieNorathHasHelmet({_p}) is true:
+        return false
+    if zombieNorathIsDaytime({_p}) is false:
+        return false
+    if zombieNorathInWater({_p}) is true:
+        return false
+    if zombieNorathExposedToSky({_p}) is false:
+        return false
+    if zombieNorathIsRainingOnHim({_p}) is true:
+        return false
+    return true
+
+function zombieNorathIsOverworld(p: player) :: boolean:
+    if environment of world of {_p} is normal:
+        return true
+    return false
+
+function zombieNorathHasHelmet(p: player) :: boolean:
+    if helmet of {_p} is air:
+        return false
+    return true
+
+function zombieNorathIsDaytime(p: player) :: boolean:
+    set {_t} to time in world of {_p}
+    if {_t} is between 6:00 and 18:00:
+        return true
+    return false
+
+function zombieNorathInWater(p: player) :: boolean:
+    if block at {_p} is water:
+        return true
+    if block at location 1 above {_p} is water:
+        return true
+    return false
+
+function zombieNorathExposedToSky(p: player) :: boolean:
+    if sunlight level at location of {_p} >= {@min-skylight}:
+        return true
+    if sunlight level at location 1 above {_p} >= {@min-skylight}:
+        return true
+    return false
+
+function zombieNorathIsRainingOnHim(p: player) :: boolean:
+    set {_w} to world of {_p}
+    if {_w} is not raining:
+        return false
+    if zombieNorathExposedToSky({_p}) is true:
+        return true
+    return false
+
+function zombieNorathIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function zombieNorathIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function zombieNorathDebug(msg: text):
+    stop
+
+function zombieNorathApplyPotionKb(p: player):
+    # Petit knockback vertical pour conserver le feedback des potions apres cancel.
+    push {_p} upwards at speed {@potion-kb-up-speed}
+
+function zombieNorathShouldInvertHealReason(reason: text) :: boolean:
+    # On veut inverser SEULEMENT les potions Instant Heal (raison Bukkit: MAGIC).
+    # On exclut explicitement MAGIC_REGEN (regen beacon, totem, potion regen) qui
+    # doit, lui, vraiment soigner Norath.
+    set {_r} to lowercase "%{_reason}%"
+    if {_r} is "magic":
+        return true
+    return false
+
+function zombieNorathShouldInvertDirectDamageCause(cause: text) :: boolean:
+    # Cas potion de degats bue: selon certains builds, remontee en "magic".
+    if {_cause} contains "magic":
+        return true
+    return false
+
+#!===============================================================================
+#! Potions instantanees style zombie
+#! - Instant Heal => degats
+#! - Instant Damage (magic) => soin
+#!===============================================================================
+
+on healing of player:
+    if zombieNorathIsTarget(event-entity) is false:
+        stop
+    if zombieNorathIsInactive(event-entity) is true:
+        stop
+
+    set {_id} to "%uuid of event-entity%"
+    if {zombieNorath.totemBypassUntil::%{_id}%} is set:
+        if now <= {zombieNorath.totemBypassUntil::%{_id}%}:
+            zombieNorathDebug("HEAL bypass (totem)")
+            stop
+        delete {zombieNorath.totemBypassUntil::%{_id}%}
+
+    set {_reason} to "%heal reason%"
+    set {_raw} to heal amount
+    zombieNorathDebug("HEAL event | player=%event-entity% | reason=%{_reason}% | amount=%{_raw}%")
+
+    if zombieNorathShouldInvertHealReason({_reason}) is false:
+        zombieNorathDebug("HEAL ignored (reason non ciblee)")
+        stop
+
+    set {_amount} to heal amount * {@instant-heal-damage-multiplier}
+    cancel event
+    if {_amount} > 0:
+        damage event-entity by {_amount}
+        zombieNorathApplyPotionKb(event-entity)
+        zombieNorathDebug("HEAL -> DAMAGE | applied=%{_amount}%")
+
+on damage of player by thrown potion:
+    if zombieNorathIsTarget(victim) is false:
+        stop
+    if zombieNorathIsInactive(victim) is true:
+        stop
+
+    set {_cause} to "%damage cause%"
+    set {_raw} to damage
+    zombieNorathDebug("DAMAGE POTION event | player=%victim% | cause=%{_cause}% | amount=%{_raw}%")
+
+    set {_amount} to damage * {@instant-harm-heal-multiplier}
+    set damage to 0
+    cancel event
+    if {_amount} > 0:
+        heal victim by {_amount}
+        zombieNorathDebug("DAMAGE POTION -> HEAL | applied=%{_amount}%")
+
+on damage of player by area effect cloud:
+    if zombieNorathIsTarget(victim) is false:
+        stop
+    if zombieNorathIsInactive(victim) is true:
+        stop
+
+    set {_cause} to "%damage cause%"
+    set {_raw} to damage
+    zombieNorathDebug("DAMAGE CLOUD event | player=%victim% | cause=%{_cause}% | amount=%{_raw}%")
+
+    set {_amount} to damage * {@instant-harm-heal-multiplier}
+    set damage to 0
+    cancel event
+    if {_amount} > 0:
+        heal victim by {_amount}
+        zombieNorathDebug("DAMAGE CLOUD -> HEAL | applied=%{_amount}%")
+
+on damage of player:
+    if zombieNorathIsTarget(victim) is false:
+        stop
+    if zombieNorathIsInactive(victim) is true:
+        stop
+
+    zombieNorathPlayHurtSound(victim)
+
+    set {_id} to "%uuid of victim%"
+    if {zombieNorath.drinkHarmUntil::%{_id}%} is set:
+        if now <= {zombieNorath.drinkHarmUntil::%{_id}%}:
+            set {_cause} to "%damage cause%"
+            set {_raw} to damage
+            zombieNorathDebug("DRINK HARM DAMAGE event | player=%victim% | cause=%{_cause}% | amount=%{_raw}%")
+            set damage to 0
+            cancel event
+            if {_raw} > 0:
+                heal victim by ({_raw} * {@instant-harm-heal-multiplier})
+                zombieNorathDebug("DRINK HARM DAMAGE -> HEAL | applied=%{_raw}%")
+            delete {zombieNorath.drinkHarmUntil::%{_id}%}
+            stop
+        delete {zombieNorath.drinkHarmUntil::%{_id}%}
+
+    # Deja pris en charge par les handlers dedies.
+    if attacker is a thrown potion:
+        stop
+    if attacker is an area effect cloud:
+        stop
+
+    set {_cause} to "%damage cause%"
+    if zombieNorathShouldInvertDirectDamageCause({_cause}) is false:
+        stop
+
+    set {_raw} to damage
+    zombieNorathDebug("DAMAGE DIRECT event | player=%victim% | cause=%{_cause}% | amount=%{_raw}%")
+
+    set {_amount} to damage * {@instant-harm-heal-multiplier}
+    set damage to 0
+    cancel event
+    if {_amount} > 0:
+        heal victim by {_amount}
+        zombieNorathDebug("DAMAGE DIRECT -> HEAL | applied=%{_amount}%")
+
+on consume:
+    if zombieNorathIsTarget(player) is false:
+        stop
+    if zombieNorathIsInactive(player) is true:
+        stop
+    if consumed item is rotten flesh:
+        wait 1 tick
+        remove potion effect of hunger from player
+        stop
+    if consumed item is potion:
+        set {_itemTxt} to "%consumed item%"
+        zombieNorathDebug("CONSUME event | player=%player% | item=%{_itemTxt}% | hp=%health of player%")
+        if {_itemTxt} contains "instant harming":
+            set {zombieNorath.drinkHarmUntil::%uuid of player%} to now + {@drink-harming-window}
+            zombieNorathDebug("DRINK HARM armed | until=%{zombieNorath.drinkHarmUntil::%uuid of player%}%")
+
+on quit:
+    if zombieNorathIsTarget(player) is false:
+        stop
+    delete {zombieNorath.drinkHarmUntil::%uuid of player%}
+    delete {zombieNorath.totemBypassUntil::%uuid of player%}
+
+on EntityResurrectEvent:
+    if event.isCancelled() is true:
+        stop
+    set {_e} to event.getEntity()
+    if {_e} is not a player:
+        stop
+    if zombieNorathIsTarget({_e}) is false:
+        stop
+    if zombieNorathIsInactive({_e}) is true:
+        stop
+
+    set {zombieNorath.totemBypassUntil::%uuid of {_e}%} to now + {@totem-heal-bypass-window}
+    zombieNorathHandleTotem({_e})
+
+function zombieNorathHandleTotem(p: player):
+    # Le totem doit fonctionner normalement : la regen (MAGIC_REGEN) soigne pour de vrai,
+    # plus aucune inversion ici. On ne touche pas aux effets ni a la vie.
+    stop
+
+#!===============================================================================
+#! DEBUG : /zombiecheck [joueur]
+#!===============================================================================
+#! Affiche l'etat des conditions de brulure pour un joueur, sans rien modifier.
+#! Permission: zombienorath.debug (op par defaut).
+#!===============================================================================
+
+command /zombiecheck [<player>]:
+    permission: zombienorath.debug
+    trigger:
+        set {_p} to arg-1
+        if {_p} is not set:
+            set {_p} to "{@target-name}" parsed as player
+        if {_p} is not online:
+            send "&cJoueur introuvable / hors-ligne." to sender
+            stop
+        zombieNorathDebugReport(sender, {_p})
+
+function zombieNorathDebugReport(viewer: object, p: player):
+    set {_t} to time in world of {_p}
+    set {_skyHere} to sunlight level at location of {_p}
+    set {_skyAbove} to sunlight level at location 1 above {_p}
+    set {_w} to world of {_p}
+    set {_helmet} to helmet of {_p}
+    set {_blockHere} to block at {_p}
+    set {_blockAbove} to block at location 1 above {_p}
+    set {_rain} to "no"
+    if {_w} is raining:
+        set {_rain} to "yes"
+    set {_should} to "NO"
+    if zombieNorathShouldBurn({_p}) is true:
+        set {_should} to "YES"
+    send "&8&m                                " to {_viewer}
+    send "&e[ZombieNorath debug] &f%{_p}%" to {_viewer}
+    send "&7monde: &f%{_w}% &7| heure: &f%{_t}%" to {_viewer}
+    send "&7overworld: &f%zombieNorathIsOverworld({_p})%" to {_viewer}
+    send "&7jour (6:00-18:00): &f%zombieNorathIsDaytime({_p})%" to {_viewer}
+    send "&7casque: &f%{_helmet}% &7(porte=%zombieNorathHasHelmet({_p})%)" to {_viewer}
+    send "&7sky-light ici: &f%{_skyHere}% &7| dessus: &f%{_skyAbove}% &7(min={@min-skylight}, expose=%zombieNorathExposedToSky({_p})%)" to {_viewer}
+    send "&7bloc ici: &f%{_blockHere}% &7| dessus: &f%{_blockAbove}% &7(eau=%zombieNorathInWater({_p})%)" to {_viewer}
+    send "&7pluie monde: &f%{_rain}% &7(pluie sur lui=%zombieNorathIsRainingOnHim({_p})%)" to {_viewer}
+    send "&7=> doit cramer: &f%{_should}%" to {_viewer}
+    send "&8&m                                " to {_viewer}
+
+function zombieNorathPlayHurtSound(p: player):
+    play sound "entity.husk.hurt" with volume 1 and pitch 0.9 at {_p}

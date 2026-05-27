@@ -1,0 +1,29 @@
+#!===============================================================================
+#! Totem Glow
+#!===============================================================================
+#! Quand un joueur "trompe la mort" avec un Totem of Undying, on lui applique
+#! l'effet "glowing" pendant quelques secondes pour que les autres voient ou il
+#! est. Pas de scoreboard team (compatibilite tab/prefix). Aucun output console.
+#!===============================================================================
+
+import:
+    org.bukkit.event.entity.EntityResurrectEvent
+    org.bukkit.potion.PotionEffect
+    org.bukkit.potion.PotionEffectType
+
+options:
+    glow-ticks: 200
+
+on EntityResurrectEvent:
+    if event.isCancelled() is false:
+        set {_e} to event.getEntity()
+        if {_e} is a player:
+            totemGlowApply({_e})
+
+function totemGlowApply(p: player):
+    # On attend 2 ticks pour que le totem ait fini de poser ses propres effets,
+    # sinon le glowing peut etre ecrase au moment de la resurrection.
+    wait 2 ticks
+    set {_eff} to new PotionEffect(PotionEffectType.GLOWING, {@glow-ticks}, 0, false, false, false)
+    {_p}.addPotionEffect({_eff}, true)
+    send action bar "§e✦ §6Totem §e✦" to {_p}

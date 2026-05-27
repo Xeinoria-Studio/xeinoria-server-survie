@@ -1,0 +1,57 @@
+on leftclick on an iron door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on an oak door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a spruce door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a birch door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a jungle door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on an acacia door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a dark oak door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a crimson door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a warped door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a mangrove door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a bamboo door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a cherry door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+on leftclick on a bamboo door:
+    # player is sneaking
+    applyDoorEffect(player, clicked block)
+
+function applyDoorEffect(p: player, b: block):
+    {_p} is a player
+    {_b} is a block
+    loop all players in radius 20 around {_b}:
+        play sound "minecraft:block.stone.break" in master category with volume 10 with pitch 0.7 at (location of {_b}) to loop-player

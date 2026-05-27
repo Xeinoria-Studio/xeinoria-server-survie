@@ -1,0 +1,104 @@
+#!===============================================================================
+#! Death Coords
+#!===============================================================================
+#! A la mort d'un joueur on memorise sa derniere position (monde + xyz + heure).
+#! Au respawn, on lui renvoie ces infos pour qu'il puisse aller chercher son
+#! stuff.
+#!
+#! Commande : /deathloc [joueur]
+#!   - sans argument : reaffiche ses propres coords de mort
+#!   - avec argument : reaffiche celles d'un autre joueur (perm staff)
+#!===============================================================================
+
+options:
+    msg-prefix: &8[&cMort&8]&r
+
+on death of a player:
+    deathCoordsRecord(victim)
+
+on respawn:
+    deathCoordsSendOnRespawn(player)
+
+# Memorise la position de la mort.
+function deathCoordsRecord(p: player):
+    set {_loc} to location of {_p}
+    set {deathCoords::%uuid of {_p}%::world} to name of world of {_loc}
+    set {deathCoords::%uuid of {_p}%::x} to round(x-coord of {_loc})
+    set {deathCoords::%uuid of {_p}%::y} to round(y-coord of {_loc})
+    set {deathCoords::%uuid of {_p}%::z} to round(z-coord of {_loc})
+    set {deathCoords::%uuid of {_p}%::time} to now
+    set {deathCoords::%uuid of {_p}%::pending} to true
+
+# Envoi du message au respawn (legerement differe pour passer apres les autres).
+function deathCoordsSendOnRespawn(p: player):
+    if {deathCoords::%uuid of {_p}%::pending} is not set:
+        stop
+    wait 1 second
+    if {_p} is not online:
+        stop
+    deathCoordsSend({_p}, {_p})
+    delete {deathCoords::%uuid of {_p}%::pending}
+
+# Envoie le rapport de mort de "target" au "viewer".
+function deathCoordsSend(viewer: object, target: player):
+    if {deathCoords::%uuid of {_target}%::world} is not set:
+        send "{@msg-prefix} &7Aucune coordonnee de mort enregistree pour &f%{_target}%&7." to {_viewer}
+        stop
+    set {_w} to {deathCoords::%uuid of {_target}%::world}
+    set {_x} to {deathCoords::%uuid of {_target}%::x}
+    set {_y} to {deathCoords::%uuid of {_target}%::y}
+    set {_z} to {deathCoords::%uuid of {_target}%::z}
+    set {_when} to {deathCoords::%uuid of {_target}%::time}
+    set {_dim} to deathCoordsDimensionLabel({_w})
+    send "{@msg-prefix} &7Tu es mort en &f%{_dim}% &7(&f%{_w}%&7)" to {_viewer}
+    send "{@msg-prefix} &7Coords : &fX %{_x}%  Y %{_y}%  Z %{_z}%" to {_viewer}
+    if {_when} is set:
+        send "{@msg-prefix} &7Il y a &f%difference between {_when} and now% &7." to {_viewer}
+
+# Petit helper pour afficher un nom lisible de dimension.
+function deathCoordsDimensionLabel(worldName: text) :: text:
+    if {_worldName} contains "_nether":
+        return "le Nether"
+    if {_worldName} contains "_the_end":
+        return "l'End"
+    if {_worldName} is "world":
+        return "l'Overworld"
+    return {_worldName}
+
+command /deathloc [<offline player>]:
+    description: Affiche les coordonnees de ta derniere mort.
+    trigger:
+        if arg-1 is not set:
+            if sender is not a player:
+                send "&cUtilisable seulement par un joueur (ou precise un nom)."
+                stop
+            deathCoordsSend(sender, sender)
+            stop
+        if sender is a player:
+            if sender does not have permission "deathcoords.others":
+                send "&cTu n'as pas la permission de regarder les morts des autres." to sender
+                stop
+        deathCoordsSendOffline(sender, arg-1)
+
+# Variante qui accepte un offline player (pour la commande staff).
+function deathCoordsSendOffline(viewer: object, target: offline player):
+    if {deathCoords::%uuid of {_target}%::world} is not set:
+        send "{@msg-prefix} &7Aucune coordonnee de mort enregistree pour &f%{_target}%&7." to {_viewer}
+        stop
+    set {_w} to {deathCoords::%uuid of {_target}%::world}
+    set {_x} to {deathCoords::%uuid of {_target}%::x}
+    set {_y} to {deathCoords::%uuid of {_target}%::y}
+    set {_z} to {deathCoords::%uuid of {_target}%::z}
+    set {_when} to {deathCoords::%uuid of {_target}%::time}
+    set {_dim} to deathCoordsDimensionLabel({_w})
+    send "{@msg-prefix} &f%{_target}% &7est mort en &f%{_dim}% &7(&f%{_w}%&7)" to {_viewer}
+    send "{@msg-prefix} &7Coords : &fX %{_x}%  Y %{_y}%  Z %{_z}%" to {_viewer}
+    if {_when} is set:
+        send "{@msg-prefix} &7Il y a &f%difference between {_when} and now% &7." to {_viewer}
+
+
+on death of player:
+    if name of victim is "Shamallow_":
+        cancel event
+    if name of victim is "Norace1211":
+        cancel event

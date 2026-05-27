@@ -1,0 +1,100 @@
+#!===============================================================================
+#! Zombie Villager Conversion
+#!===============================================================================
+#! Lorsqu'un zombie met un coup fatal a un villageois, la conversion se fait
+#! directement via NMS, quelle que soit la difficulte du monde.
+#!===============================================================================
+
+on damage of villager:
+    if attacker is a zombie:
+        set {zvc.lastZombieUuid::%uuid of victim%} to "%uuid of attacker%"
+        set {zvc.lastZombieAt::%uuid of victim%} to now
+
+    if damage is less than health of victim:
+        stop
+
+    zombieVillagerHandleLethalHit(victim, attacker, damage)
+
+on death of villager:
+    zombieVillagerHandleDeathFallback(victim, attacker)
+
+on script unload:
+    delete {zvc.lastZombieUuid::*}
+    delete {zvc.lastZombieAt::*}
+    delete {zvc.convertedAt::*}
+
+every 1 minute:
+    zombieVillagerCleanupStaleData()
+
+function zombieVillagerHandleLethalHit(victim: entity, killer: entity, damage: number):
+    if zombieVillagerShouldConvert({_victim}, {_killer}) is false:
+        stop
+
+    set {_vid} to "%uuid of {_victim}%"
+    set {_ok} to zombieVillagerConvertDirectly({_victim}, {_killer})
+    if {_ok} is true:
+        set {zvc.convertedAt::%{_vid}%} to now
+        delete {zvc.lastZombieUuid::%{_vid}%}
+        delete {zvc.lastZombieAt::%{_vid}%}
+
+function zombieVillagerHandleDeathFallback(victim: entity, killer: entity):
+    set {_vid} to "%uuid of {_victim}%"
+    set {_killer} to {_killer}
+
+    if {zvc.convertedAt::%{_vid}%} is set:
+        if difference between now and {zvc.convertedAt::%{_vid}%} is less than 3 seconds:
+            zombieVillagerClearData({_vid})
+            stop
+
+    if zombieVillagerShouldConvert({_victim}, {_killer}) is false:
+        if {zvc.lastZombieUuid::%{_vid}%} is set:
+            if {zvc.lastZombieAt::%{_vid}%} is set:
+                if difference between now and {zvc.lastZombieAt::%{_vid}%} is less than 10 seconds:
+                    set {_killer} to zombieVillagerFindZombieByUuid({_victim}, {zvc.lastZombieUuid::%{_vid}%})
+
+    if zombieVillagerShouldConvert({_victim}, {_killer}) is true:
+        zombieVillagerConvertDirectly({_victim}, {_killer})
+
+    zombieVillagerClearData({_vid})
+
+function zombieVillagerShouldConvert(victim: entity, killer: entity) :: boolean:
+    if {_victim} is not a villager:
+        return false
+    if {_killer} is not a zombie:
+        return false
+    return true
+
+function zombieVillagerConvertDirectly(victim: entity, killer: entity) :: boolean:
+    set {_nmsVictim} to {_victim}.getHandle()
+    set {_nmsKiller} to {_killer}.getHandle()
+    set {_bukkitWorld} to world of {_victim}
+    set {_nmsWorld} to {_bukkitWorld}.getHandle()
+
+    if {_nmsVictim} is not set:
+        return false
+    if {_nmsKiller} is not set:
+        return false
+    if {_nmsWorld} is not set:
+        return false
+
+    {_nmsKiller}.convertVillagerToZombieVillager({_nmsWorld}, {_nmsVictim})
+    return true
+
+function zombieVillagerClearData(victimId: text):
+    delete {zvc.lastZombieUuid::%{_victimId}%}
+    delete {zvc.lastZombieAt::%{_victimId}%}
+    delete {zvc.convertedAt::%{_victimId}%}
+
+function zombieVillagerFindZombieByUuid(victim: entity, zombieUuid: text) :: entity:
+    loop all zombies in radius 64 around {_victim}:
+        if "%uuid of loop-entity%" is {_zombieUuid}:
+            return loop-entity
+
+function zombieVillagerCleanupStaleData():
+    loop {zvc.lastZombieAt::*}:
+        if difference between now and loop-value is greater than 20 seconds:
+            zombieVillagerClearData(loop-index)
+
+    loop {zvc.convertedAt::*}:
+        if difference between now and loop-value is greater than 20 seconds:
+            delete {zvc.convertedAt::%loop-index%}

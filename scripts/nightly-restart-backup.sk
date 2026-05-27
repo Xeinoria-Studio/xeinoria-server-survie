@@ -1,0 +1,32 @@
+# Redemarrage nocturne quotidien pour declencher un backup au prochain boot.
+# Le backup est lance dans start.sh avant le demarrage de Paper.
+# Utilise un evenement system-time natif de Skript (pas de polling chaque minute).
+
+function nightly_restart_sequence():
+    broadcast "&6[Maintenance] &fRedemarrage automatique dans &e10 minutes&f pour sauvegarde."
+    broadcast "&6[Maintenance] &fLa sauvegarde qui suit le redemarrage peut prendre plusieurs minutes selon la taille du monde."
+    wait 5 minutes
+    broadcast "&6[Maintenance] &fRedemarrage automatique dans &e5 minutes&f."
+    wait 4 minutes
+    broadcast "&6[Maintenance] &fRedemarrage automatique dans &e1 minute&f."
+    wait 30 seconds
+    broadcast "&6[Maintenance] &fRedemarrage automatique dans &e30 secondes&f."
+    wait 20 seconds
+    broadcast "&6[Maintenance] &fRedemarrage automatique dans &e10 secondes&f."
+    wait 10 seconds
+    execute console command "save-all"
+    wait 8 seconds
+    execute console command "stop"
+
+at 04:00 in real time:
+    nightly_restart_sequence()
+
+command /nightlyrestarttest [<text>]:
+    permission: op
+    trigger:
+        if arg-1 is "run":
+            send "&6[Maintenance] &fTest manuel lance: sequence complete de redemarrage." to player
+            send "&eLa sauvegarde peut durer plusieurs minutes selon la taille du monde." to player
+            nightly_restart_sequence()
+            stop
+        send "&cUtilisation: /nightlyrestarttest run" to player

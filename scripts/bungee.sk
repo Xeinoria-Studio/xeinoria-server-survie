@@ -1,0 +1,4 @@
+command /testbungee:
+    trigger:
+        execute console command "stop"
+        

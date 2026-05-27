@@ -1,0 +1,497 @@
+#!===============================================================================
+#! Witch-Onalia
+#!===============================================================================
+#! Cible : Onalia uniquement (serveur survie).
+#! - Clic droit avec une epee enchantee : invocation de vex (2 a 4)
+#! - Shift + clic droit : crocs d'evocateur autour d'elle
+#! - Desactive en vanish / creative / spectator
+#!===============================================================================
+
+options:
+    target-name: Onalia
+    vex-cooldown: 4 seconds
+    fangs-cooldown: 5 seconds
+    vex-min-count: 2
+    vex-max-count: 4
+    vex-lifetime: 16 seconds
+    vex-target-radius: 18
+    vex-focus-health: 0.4
+    vex-focus-duration: 6 seconds
+    vex-spawn-radius: 2.5
+    fangs-ring-radius: 3
+    fangs-ring-radius-inner: 1.5
+    fangs-line-count: 9
+    fangs-line-step: 1.45
+    particle-period: 10 ticks
+    particle-view-radius: 24
+    particle-count: 8
+
+function onaliaWitchIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function onaliaWitchIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function onaliaWitchIsSword(it: itemstack) :: boolean:
+    if {_it} is wooden sword:
+        return true
+    if {_it} is stone sword:
+        return true
+    if {_it} is iron sword:
+        return true
+    if {_it} is golden sword:
+        return true
+    if {_it} is diamond sword:
+        return true
+    if {_it} is netherite sword:
+        return true
+    return false
+
+function onaliaWitchCanCastWith(it: itemstack) :: boolean:
+    if onaliaWitchIsSword({_it}) is false:
+        return false
+    if {_it} is enchanted:
+        return true
+    return false
+
+function onaliaWitchVexReady(p: player) :: boolean:
+    set {_id} to "%uuid of {_p}%"
+    if {onaliaWitch.vexCd::%{_id}%} is not set:
+        return true
+    if now >= {onaliaWitch.vexCd::%{_id}%}:
+        return true
+    return false
+
+function onaliaWitchFangsReady(p: player) :: boolean:
+    set {_id} to "%uuid of {_p}%"
+    if {onaliaWitch.fangsCd::%{_id}%} is not set:
+        return true
+    if now >= {onaliaWitch.fangsCd::%{_id}%}:
+        return true
+    return false
+
+function onaliaWitchMarkVexCooldown(p: player):
+    set {onaliaWitch.vexCd::%uuid of {_p}%} to now + {@vex-cooldown}
+
+function onaliaWitchMarkFangsCooldown(p: player):
+    set {onaliaWitch.fangsCd::%uuid of {_p}%} to now + {@fangs-cooldown}
+
+function onaliaWitchRecallAllVex():
+    loop all vexes in all worlds:
+        set {_id} to "%uuid of loop-entity%"
+        if {onaliaWitch.vexExpire::%{_id}%} is set:
+            kill loop-entity
+            delete {onaliaWitch.vexExpire::%{_id}%}
+            delete {onaliaWitch.vexForced::%{_id}%}
+            delete {onaliaWitch.vexFocus::%{_id}%}
+            delete {onaliaWitch.vexFocusUntil::%{_id}%}
+
+function onaliaWitchRememberAttacker(e: entity):
+    if {_e} is not set:
+        stop
+    if {_e} is vex:
+        stop
+    if {_e} is player:
+        if onaliaWitchIsTarget({_e}) is true:
+            stop
+        if {_e} is offline:
+            stop
+        if {_e} is dead:
+            stop
+        if {_e} is not in {onaliaWitch.attackers::*}:
+            add {_e} to {onaliaWitch.attackers::*}
+        stop
+    if {_e} is monster:
+        if {_e} is dead:
+            stop
+        if {_e} is not in {onaliaWitch.attackers::*}:
+            add {_e} to {onaliaWitch.attackers::*}
+
+function onaliaWitchCleanupAttackers():
+    loop {onaliaWitch.attackers::*}:
+        if loop-value is not set:
+            remove loop-value from {onaliaWitch.attackers::*}
+        else:
+            if loop-value is dead:
+                remove loop-value from {onaliaWitch.attackers::*}
+            else if loop-value is player:
+                if loop-value is offline:
+                    remove loop-value from {onaliaWitch.attackers::*}
+                else if onaliaWitchIsTarget(loop-value) is true:
+                    remove loop-value from {onaliaWitch.attackers::*}
+
+function onaliaWitchIsRememberedAttacker(p: player) :: boolean:
+    onaliaWitchCleanupAttackers()
+    if {_p} is in {onaliaWitch.attackers::*}:
+        return true
+    return false
+
+function onaliaWitchGetOnaliaTarget(p: player) :: entity:
+    set {_c} to target of {_p}
+    if {_c} is set:
+        return {_c}
+    set {_c} to target entity of {_p}
+    if {_c} is set:
+        return {_c}
+    return {none}
+
+function onaliaWitchStartFocus(v: entity, target: entity):
+    set {_id} to "%uuid of {_v}%"
+    set {onaliaWitch.vexFocus::%{_id}%} to {_target}
+    set {onaliaWitch.vexFocusUntil::%{_id}%} to now + {@vex-focus-duration}
+
+function onaliaWitchIsFocused(v: entity) :: boolean:
+    set {_id} to "%uuid of {_v}%"
+    if {onaliaWitch.vexFocus::%{_id}%} is not set:
+        return false
+    if now >= {onaliaWitch.vexFocusUntil::%{_id}%}:
+        delete {onaliaWitch.vexFocus::%{_id}%}
+        delete {onaliaWitch.vexFocusUntil::%{_id}%}
+        return false
+    set {_target} to {onaliaWitch.vexFocus::%{_id}%}
+    if {_target} is not set:
+        return false
+    if {_target} is dead:
+        delete {onaliaWitch.vexFocus::%{_id}%}
+        delete {onaliaWitch.vexFocusUntil::%{_id}%}
+        return false
+    return true
+
+function onaliaWitchFindForcedPlayer(v: entity) :: player:
+    set {_id} to {onaliaWitch.vexForced::%uuid of {_v}%}
+    if {_id} is not set:
+        return {none}
+    loop all players:
+        if "%uuid of loop-player%" is "%{_id}%":
+            return loop-player
+    return {none}
+
+function onaliaWitchPickNearestMonster(fromLoc: location) :: entity:
+    set {_best} to {none}
+    set {_bestDist} to 9999
+
+    loop all monsters in radius {@vex-target-radius} around {_fromLoc}:
+        if loop-entity is not vex:
+            set {_d} to distance between loop-entity and {_fromLoc}
+            if {_d} < {_bestDist}:
+                set {_bestDist} to {_d}
+                set {_best} to loop-entity
+
+    return {_best}
+
+function onaliaWitchPickNearestAttacker(fromLoc: location) :: entity:
+    set {_best} to {none}
+    set {_bestDist} to 9999
+
+    onaliaWitchCleanupAttackers()
+
+    loop {onaliaWitch.attackers::*}:
+        set {_a} to loop-value
+        if {_a} is set:
+            if world of {_a} is world of {_fromLoc}:
+                set {_d} to distance between {_a} and {_fromLoc}
+                if {_d} <= {@vex-target-radius}:
+                    if {_d} < {_bestDist}:
+                        set {_bestDist} to {_d}
+                        set {_best} to {_a}
+
+    return {_best}
+
+function onaliaWitchPickOnaliaTarget(fromLoc: location) :: entity:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is not online:
+        return {none}
+    set {_c} to onaliaWitchGetOnaliaTarget({_p})
+    if {_c} is set:
+        if world of {_c} is world of {_fromLoc}:
+            set {_d} to distance between {_c} and {_fromLoc}
+            if {_d} <= {@vex-target-radius}:
+                return {_c}
+    return {none}
+
+function onaliaWitchPickNearestTarget(fromLoc: location) :: entity:
+    set {_o} to onaliaWitchPickOnaliaTarget({_fromLoc})
+    if {_o} is set:
+        return {_o}
+
+    set {_a} to onaliaWitchPickNearestAttacker({_fromLoc})
+    if {_a} is set:
+        return {_a}
+
+    set {_m} to onaliaWitchPickNearestMonster({_fromLoc})
+    if {_m} is set:
+        return {_m}
+
+    return {none}
+
+function onaliaWitchAssignVexTarget(v: entity):
+    set {_focused} to onaliaWitchIsFocused({_v})
+    if {_focused} is true:
+        set {_id} to "%uuid of {_v}%"
+        set {_t} to {onaliaWitch.vexFocus::%{_id}%}
+        if {_t} is set:
+            if {_t} is not dead:
+                set target of {_v} to {_t}
+                stop
+
+    set {_forced} to onaliaWitchFindForcedPlayer({_v})
+    if {_forced} is set:
+        if onaliaWitchIsTarget({_forced}) is false:
+            if {_forced} is online:
+                if {_forced} is not dead:
+                    set target of {_v} to {_forced}
+                    stop
+    delete {onaliaWitch.vexForced::%uuid of {_v}%}
+
+    set {_t} to onaliaWitchPickNearestTarget(location of {_v})
+    if {_t} is set:
+        if health of {_t} <= (max health of {_t}) * {@vex-focus-health}:
+            onaliaWitchStartFocus({_v}, {_t})
+        set target of {_v} to {_t}
+    else:
+        delete target of {_v}
+
+function onaliaWitchCastVexSwarm(p: player, forcedId: text):
+    set {_count} to a random integer between {@vex-min-count} and {@vex-max-count}
+    loop {_count} times:
+        set {_base} to location of {_p}
+        set {_rx} to random number between (-1 * {@vex-spawn-radius}) and {@vex-spawn-radius}
+        set {_rz} to random number between (-1 * {@vex-spawn-radius}) and {@vex-spawn-radius}
+        set {_spawn} to location ((x-coord of {_base}) + {_rx}), ((y-coord of {_base}) + 1.2), ((z-coord of {_base}) + {_rz}) in world of {_p}
+        summon vex at {_spawn}
+        set {_v} to last spawned entity
+        if {_forcedId} is not "":
+            set {onaliaWitch.vexForced::%uuid of {_v}%} to {_forcedId}
+        set {onaliaWitch.vexExpire::%uuid of {_v}%} to now + {@vex-lifetime}
+        onaliaWitchAssignVexTarget({_v})
+    play sound "entity.evoker.cast_spell" with volume 1 and pitch 1 at {_p}
+
+function onaliaWitchSpawnFangsAt(p: player, xOff: number, zOff: number):
+    set {_base} to location of {_p}
+    set {_l} to location ((x-coord of {_base}) + {_xOff}), (y-coord of {_base}), ((z-coord of {_base}) + {_zOff}) in world of {_p}
+    summon evoker fangs at {_l}
+
+function onaliaWitchCastFangs(p: player):
+    set {_r} to {@fangs-ring-radius}
+    onaliaWitchSpawnFangsAt({_p}, {_r}, 0)
+    onaliaWitchSpawnFangsAt({_p}, (-1 * {_r}), 0)
+    onaliaWitchSpawnFangsAt({_p}, 0, {_r})
+    onaliaWitchSpawnFangsAt({_p}, 0, (-1 * {_r}))
+    onaliaWitchSpawnFangsAt({_p}, ({_r} * 0.7), ({_r} * 0.7))
+    onaliaWitchSpawnFangsAt({_p}, (-0.7 * {_r}), (-0.7 * {_r}))
+    onaliaWitchSpawnFangsAt({_p}, ({_r} * 0.7), (-0.7 * {_r}))
+    onaliaWitchSpawnFangsAt({_p}, (-0.7 * {_r}), ({_r} * 0.7))
+    # Anneau interieur
+    set {_ri} to {@fangs-ring-radius-inner}
+    onaliaWitchSpawnFangsAt({_p}, {_ri}, 0)
+    onaliaWitchSpawnFangsAt({_p}, (-1 * {_ri}), 0)
+    onaliaWitchSpawnFangsAt({_p}, 0, {_ri})
+    onaliaWitchSpawnFangsAt({_p}, 0, (-1 * {_ri}))
+    play sound "entity.evoker.cast_spell" with volume 0.95 and pitch 0.8 at {_p}
+
+function onaliaWitchCastFangsFront(p: player):
+    set {_from} to location of {_p}
+    set {_to} to location of target block of {_p}
+
+    if {_to} is not set:
+        set {_to} to location ((x-coord of {_from}) + 0.01), (y-coord of {_from}), ((z-coord of {_from}) + 1) in world of {_p}
+
+    set {_dx} to (x-coord of {_to}) - (x-coord of {_from})
+    set {_dz} to (z-coord of {_to}) - (z-coord of {_from})
+
+    set {_adx} to {_dx}
+    if {_adx} < 0:
+        set {_adx} to {_adx} * -1
+    set {_adz} to {_dz}
+    if {_adz} < 0:
+        set {_adz} to {_adz} * -1
+
+    set {_len} to {_adx} + {_adz}
+    if {_len} <= 0:
+        set {_len} to 1
+
+    set {_nx} to {_dx} / {_len}
+    set {_nz} to {_dz} / {_len}
+
+    set {_baseY} to y-coord of {_from}
+
+    loop {@fangs-line-count} times:
+        set {_d} to loop-number * {@fangs-line-step}
+        set {_x} to (x-coord of {_from}) + ({_nx} * {_d})
+        set {_z} to (z-coord of {_from}) + ({_nz} * {_d})
+
+        # Cherche le sol : descend depuis le Y courant jusqu'a trouver un bloc solide
+        set {_y} to {_baseY}
+        loop 8 times:
+            set {_check} to block at location {_x}, ({_y} - 1), {_z} in world of {_p}
+            if {_check} is solid:
+                stop loop
+            set {_y} to {_y} - 1
+
+        set {_l} to location {_x}, {_y}, {_z} in world of {_p}
+        summon evoker fangs at {_l}
+
+on right click:
+    if onaliaWitchIsTarget(player) is false:
+        stop
+    if onaliaWitchIsInactive(player) is true:
+        stop
+    if onaliaWitchCanCastWith(tool of player) is false:
+        stop
+
+    if player is sneaking:
+        if onaliaWitchFangsReady(player) is false:
+            stop
+        onaliaWitchMarkFangsCooldown(player)
+        onaliaWitchCastFangs(player)
+        onaliaWitchCastFangsFront(player)
+        stop
+
+    if onaliaWitchVexReady(player) is false:
+        stop
+    onaliaWitchMarkVexCooldown(player)
+    onaliaWitchRecallAllVex()
+    set {_forcedId} to ""
+    set {_aim} to target entity of player
+    if {_aim} is player:
+        if onaliaWitchIsTarget({_aim}) is false:
+            set {_forcedId} to "%uuid of {_aim}%"
+    else:
+        delete {onaliaWitch.attackers::*}
+    onaliaWitchCastVexSwarm(player, {_forcedId})
+
+every 1 second:
+    onaliaWitchCleanupAttackers()
+    loop all vexes in all worlds:
+        set {_id} to "%uuid of loop-entity%"
+        if {onaliaWitch.vexExpire::%{_id}%} is set:
+            if now >= {onaliaWitch.vexExpire::%{_id}%}:
+                kill loop-entity
+                delete {onaliaWitch.vexExpire::%{_id}%}
+                delete {onaliaWitch.vexForced::%{_id}%}
+                delete {onaliaWitch.vexFocus::%{_id}%}
+                delete {onaliaWitch.vexFocusUntil::%{_id}%}
+
+every 10 ticks:
+    loop all vexes in all worlds:
+        set {_id} to "%uuid of loop-entity%"
+        if {onaliaWitch.vexExpire::%{_id}%} is set:
+            if target of loop-entity is not set:
+                onaliaWitchAssignVexTarget(loop-entity)
+            else if target of loop-entity is player:
+                if onaliaWitchIsTarget(target of loop-entity) is true:
+                    delete target of loop-entity
+                    onaliaWitchAssignVexTarget(loop-entity)
+            else if onaliaWitchIsFocused(loop-entity) is false:
+                onaliaWitchAssignVexTarget(loop-entity)
+
+on damage of player by vex:
+    if onaliaWitchIsTarget(victim) is false:
+        stop
+    cancel event
+
+on damage of player:
+    if onaliaWitchIsTarget(victim) is false:
+        stop
+    if attacker is not set:
+        stop
+    onaliaWitchRememberAttacker(attacker)
+    if "%type of attacker%" contains "evoker":
+        cancel event
+
+on entity target:
+    if entity is not vex:
+        stop
+    if target is not player:
+        stop
+    if onaliaWitchIsTarget(target) is true:
+        cancel event
+        delete target of entity
+        onaliaWitchAssignVexTarget(entity)
+        stop
+
+    set {_forcedId} to {onaliaWitch.vexForced::%uuid of entity%}
+    if {_forcedId} is set:
+        if "%uuid of target%" is "%{_forcedId}%":
+            stop
+        cancel event
+        delete target of entity
+        onaliaWitchAssignVexTarget(entity)
+        stop
+
+    if onaliaWitchIsRememberedAttacker(target) is true:
+        stop
+
+    cancel event
+    delete target of entity
+    onaliaWitchAssignVexTarget(entity)
+
+on death of vex:
+    set {_id} to "%uuid of victim%"
+    set {onaliaWitch.noXpAt::%{_id}%} to location of victim
+    set {onaliaWitch.noXpUntil::%{_id}%} to now + 2 seconds
+    delete {onaliaWitch.vexExpire::%uuid of victim%}
+    delete {onaliaWitch.vexForced::%uuid of victim%}
+    delete {onaliaWitch.vexFocus::%uuid of victim%}
+    delete {onaliaWitch.vexFocusUntil::%uuid of victim%}
+
+on experience spawn:
+    loop {onaliaWitch.noXpUntil::*}:
+        set {_id} to loop-index
+        if now > loop-value:
+            delete {onaliaWitch.noXpUntil::%{_id}%}
+            delete {onaliaWitch.noXpAt::%{_id}%}
+        else:
+            set {_loc} to {onaliaWitch.noXpAt::%{_id}%}
+            if {_loc} is set:
+                if world of event-location is world of {_loc}:
+                    if distance between event-location and {_loc} <= 3:
+                        cancel event
+                        stop
+
+# Aura table d'enchantement legere.
+every {@particle-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is online:
+        if onaliaWitchIsInactive({_p}) is true:
+            stop
+        onaliaWitchAmbientFx({_p})
+
+function onaliaWitchAmbientFx(p: player):
+    if onaliaWitchShouldShowParticles({_p}) is false:
+        stop
+    loop all players in radius {@particle-view-radius} around {_p}:
+        show {@particle-count} "enchant" particles at location of {_p} for loop-player
+
+function onaliaWitchShouldShowParticles(p: player) :: boolean:
+    if {hidden::%uuid of {_p}%} is true:
+        return false
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return false
+    if {_p} has invisibility:
+        return false
+    set {_h} to helmet of {_p}
+    if {_h} is carved pumpkin or pumpkin:
+        return false
+    if {_h} is creeper head or zombie head or skeleton skull or wither skeleton skull or dragon head:
+        return false
+    return true
+
+on quit:
+    if onaliaWitchIsTarget(player) is false:
+        stop
+    delete {onaliaWitch.vexCd::%uuid of player%}
+    delete {onaliaWitch.fangsCd::%uuid of player%}
+    delete {onaliaWitch.attackers::*}

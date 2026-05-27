@@ -1,0 +1,291 @@
+#!===============================================================================
+#! Chat-Frisk
+#!===============================================================================
+#! Cible : frisk_uzumaki uniquement (serveur survie).
+#! - 1 coeur max (style "chat")
+#! - Poisson uniquement pour manger
+#! - Slowness + Weakness + Darkness dans l'eau/pluie
+#!   (ignore avec Aqua Affinity/Respiration)
+#! - Speed + Night Vision permanents
+#! - Les creepers fuient, mais explosion en cas de contact
+#!===============================================================================
+
+options:
+    target-name: frisk_uzumaki
+    upkeep-period: 2 seconds
+    creeper-check-period: 1 tick
+    cat-max-health: 9
+    default-max-health: 20
+    speed-tier: 1
+    water-debuff-duration: 6 seconds
+    water-slowness-tier: 1
+    water-weakness-tier: 1
+    creeper-fear-radius: 12
+    creeper-flee-distance: 8
+    creeper-flee-speed: 1.4
+    creeper-flee-cooldown: 4 seconds
+    fall-damage-multiplier: 0.15
+
+function friskCatIsTarget(p: player) :: boolean:
+    if name of {_p} is "{@target-name}":
+        return true
+    return false
+
+function friskCatIsInactive(p: player) :: boolean:
+    if gamemode of {_p} is creative:
+        return true
+    if gamemode of {_p} is spectator:
+        return true
+    if {hidden::%uuid of {_p}%} is true:
+        return true
+    set {_v} to placeholder "premiumvanish_isvanished" from {_p}
+    if {_v} is "Yes":
+        return true
+    return false
+
+function friskCatHasAquaAffinity(p: player) :: boolean:
+    set {_helmet} to helmet of {_p}
+    if {_helmet} is air:
+        return false
+    if {_helmet} is enchanted with aqua affinity:
+        return true
+    if {_helmet} is enchanted with respiration:
+        return true
+    return false
+
+function friskCatShouldGetWaterDebuffs(p: player) :: boolean:
+    if friskCatHasAquaAffinity({_p}) is true:
+        return false
+
+    if block at {_p} is water:
+        return true
+    if block at location 1 above {_p} is water:
+        return true
+
+    set {_w} to world of {_p}
+    if {_w} is raining:
+        if sunlight level at location of {_p} > 0:
+            return true
+        if sunlight level at location 1 above {_p} > 0:
+            return true
+
+    return false
+
+function friskCatIsInWater(p: player) :: boolean:
+    if block at {_p} is water:
+        return true
+    if block at location 1 above {_p} is water:
+        return true
+    return false
+
+function friskCatApplyCoreBuffs(p: player):
+    apply potion effect of speed of tier {@speed-tier} to {_p} for 15 seconds:
+        hide the particles
+        hide the icon
+
+    apply potion effect of night vision of tier 1 to {_p} for 15 seconds:
+        hide the particles
+        hide the icon
+
+    set max health of {_p} to {@cat-max-health}
+    if health of {_p} > max health of {_p}:
+        set health of {_p} to max health of {_p}
+
+function friskCatRemoveCoreBuffs(p: player):
+    remove speed from {_p}
+    remove night vision from {_p}
+
+function friskCatDisableAll(p: player):
+    friskCatRemoveCoreBuffs({_p})
+    friskCatRemoveWaterDebuffs({_p})
+    set max health of {_p} to {@default-max-health}
+    if health of {_p} > max health of {_p}:
+        set health of {_p} to max health of {_p}
+
+function friskCatApplyWaterDebuffs(p: player):
+    apply potion effect of slowness of tier {@water-slowness-tier} to {_p} for {@water-debuff-duration}:
+        hide the particles
+        hide the icon
+
+    apply potion effect of weakness of tier {@water-weakness-tier} to {_p} for {@water-debuff-duration}:
+        hide the particles
+        hide the icon
+
+function friskCatRemoveWaterDebuffs(p: player):
+    remove slowness from {_p}
+    remove weakness from {_p}
+
+function friskCatIsAlwaysAllowedFood(it: itemstack) :: boolean:
+    if {_it} is golden apple:
+        return true
+    if {_it} is enchanted golden apple:
+        return true
+    if {_it} is golden carrot:
+        return true
+    return false
+
+function friskCatIsForbiddenFood(it: itemstack) :: boolean:
+    # Viandes (cru/cuit)
+    if {_it} is beef or cooked beef:
+        return true
+    if {_it} is porkchop or cooked porkchop:
+        return true
+    if {_it} is mutton or cooked mutton:
+        return true
+    if {_it} is salmon or cooked salmon:
+        return true
+    if {_it} is tropical fish:
+        return true
+
+    # Legumes
+    if {_it} is carrot:
+        return true
+    if {_it} is potato or baked potato or poisonous potato:
+        return true
+    if {_it} is beetroot:
+        return true
+    return false
+
+function friskCatOrderCreeperFlee(c: entity, p: player):
+    set {_cl} to location of {_c}
+    set {_pl} to location of {_p}
+
+    set {_dx} to (x-coord of {_cl}) - (x-coord of {_pl})
+    set {_dz} to (z-coord of {_cl}) - (z-coord of {_pl})
+
+    if {_dx} is between -0.15 and 0.15:
+        set {_dx} to random number between -1 and 1
+    if {_dz} is between -0.15 and 0.15:
+        set {_dz} to random number between -1 and 1
+
+    set {_adx} to {_dx}
+    if {_adx} < 0:
+        set {_adx} to {_adx} * -1
+    set {_adz} to {_dz}
+    if {_adz} < 0:
+        set {_adz} to {_adz} * -1
+
+    set {_len} to {_adx} + {_adz}
+    if {_len} <= 0:
+        set {_len} to 1
+
+    set {_nx} to {_dx} / {_len}
+    set {_nz} to {_dz} / {_len}
+    set {_tx} to (x-coord of {_cl}) + ({_nx} * {@creeper-flee-distance})
+    set {_tz} to (z-coord of {_cl}) + ({_nz} * {@creeper-flee-distance})
+    set {_escape} to location {_tx}, (y-coord of {_cl}), {_tz} in world of {_p}
+
+    set {friskCat.creeperFleeUntil::%uuid of {_c}%} to now + {@creeper-flee-cooldown}
+    make {_c} pathfind towards {_escape} at speed {@creeper-flee-speed}
+
+function friskCatCreeperIsFleeing(c: entity) :: boolean:
+    set {_id} to "%uuid of {_c}%"
+    if {friskCat.creeperFleeUntil::%{_id}%} is not set:
+        return false
+    if now <= {friskCat.creeperFleeUntil::%{_id}%}:
+        return true
+    delete {friskCat.creeperFleeUntil::%{_id}%}
+    return false
+
+on join:
+    if friskCatIsTarget(player) is false:
+        stop
+    if friskCatIsInactive(player) is true:
+        friskCatDisableAll(player)
+        stop
+    if friskCatIsInWater(player) is true:
+        friskCatRemoveCoreBuffs(player)
+    else:
+        friskCatApplyCoreBuffs(player)
+    friskCatRemoveWaterDebuffs(player)
+
+every {@upkeep-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is not online:
+        stop
+    if friskCatIsInactive({_p}) is true:
+        friskCatDisableAll({_p})
+        stop
+
+    if friskCatIsInWater({_p}) is true:
+        friskCatRemoveCoreBuffs({_p})
+    else:
+        friskCatApplyCoreBuffs({_p})
+
+    if friskCatShouldGetWaterDebuffs({_p}) is true:
+        friskCatApplyWaterDebuffs({_p})
+    else:
+        friskCatRemoveWaterDebuffs({_p})
+
+every {@creeper-check-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is not online:
+        stop
+    if friskCatIsInactive({_p}) is true:
+        stop
+
+    loop creepers in radius {@creeper-fear-radius} around {_p}:
+        if target of loop-entity is {_p}:
+            delete target of loop-entity
+        delete target of loop-entity
+        friskCatOrderCreeperFlee(loop-entity, {_p})
+
+on entity target:
+    if entity is not creeper:
+        stop
+
+    # Pendant cooldown de fuite, le creeper ne peut pas reprendre d'aggro.
+    if friskCatCreeperIsFleeing(entity) is true:
+        cancel event
+        if target is player:
+            if friskCatIsTarget(target) is true:
+                if friskCatIsInactive(target) is false:
+                    friskCatOrderCreeperFlee(entity, target)
+        stop
+
+    if target is not player:
+        stop
+    if friskCatIsTarget(target) is false:
+        stop
+    if friskCatIsInactive(target) is true:
+        stop
+
+    cancel event
+    delete target of entity
+    friskCatOrderCreeperFlee(entity, target)
+
+on explode:
+    if event-entity is not set:
+        stop
+    if event-entity is not creeper:
+        stop
+    if friskCatCreeperIsFleeing(event-entity) is true:
+        cancel event
+
+on consume:
+    if friskCatIsTarget(player) is false:
+        stop
+    if friskCatIsInactive(player) is true:
+        stop
+
+    if consumed item is pufferfish:
+        # Laisse la nourriture s'appliquer, puis nettoie les effets negatifs.
+        wait 1 tick
+        remove poison from player
+        remove nausea from player
+        remove potion effect of hunger from player
+        stop
+
+    if friskCatIsAlwaysAllowedFood(consumed item) is true:
+        stop
+    if friskCatIsForbiddenFood(consumed item) is true:
+        cancel event
+
+on damage of player:
+    if friskCatIsTarget(victim) is false:
+        stop
+    if friskCatIsInactive(victim) is true:
+        stop
+    if damage cause is not fall:
+        stop
+    set damage to damage * {@fall-damage-multiplier}

@@ -1,0 +1,78 @@
+#!===============================================================================
+#! Astronaute - Tsc_Goubil
+#!===============================================================================
+#! Spell:
+#! - Clic droit avec l'item de sort
+#! - Slow Falling pendant 3 secondes
+#! - Cooldown configurable
+#!===============================================================================
+
+options:
+    target-name: Tsc_Goubil
+    slow-falling-duration: 5 seconds
+    spell-cooldown: 6 seconds
+    upkeep-period: 5 ticks
+    jump-boost-duration: 12 ticks
+
+function astronautIsSword(it: itemstack) :: boolean:
+    if {_it} is wooden sword:
+        return true
+    if {_it} is stone sword:
+        return true
+    if {_it} is iron sword:
+        return true
+    if {_it} is golden sword:
+        return true
+    if {_it} is diamond sword:
+        return true
+    if {_it} is netherite sword:
+        return true
+    return false
+
+function astronautCanCast(p: player) :: boolean:
+    set {_id} to "%uuid of {_p}%"
+    if {astronaut.spellCd::%{_id}%} is not set:
+        return true
+    if now >= {astronaut.spellCd::%{_id}%}:
+        return true
+    return false
+
+function astronautMarkCooldown(p: player):
+    set {astronaut.spellCd::%uuid of {_p}%} to now + {@spell-cooldown}
+
+function astronautApplyPermanentJumpBoost(p: player):
+    apply potion effect of jump boost 2 to {_p} for {@jump-boost-duration}:
+        hide the particles
+        hide the icon
+
+every {@upkeep-period}:
+    set {_p} to "{@target-name}" parsed as player
+    if {_p} is online:
+        astronautApplyPermanentJumpBoost({_p})
+
+on right click:
+    if name of player is not "{@target-name}":
+        stop
+    if astronautIsSword(tool of player) is false:
+        stop
+    if astronautCanCast(player) is false:
+        stop
+
+    apply potion effect of slow falling to player for {@slow-falling-duration}:
+        hide the particles
+        hide the icon
+
+    astronautMarkCooldown(player)
+    play sound "entity.phantom.flap" with volume 0.8 and pitch 1.35 at player
+
+on quit:
+    if name of player is not "{@target-name}":
+        stop
+    remove jump boost from player
+    delete {astronaut.spellCd::%uuid of player%}
+
+on death of player:
+    if name of victim is not "{@target-name}":
+        stop
+    remove jump boost from victim
+    delete {astronaut.spellCd::%uuid of victim%}

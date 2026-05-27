@@ -1,0 +1,33 @@
+on chat:
+    set {_h} to "❤"
+    set {_colors} to "0123456789abcdef"
+
+    # --- ÉTAPE 1 : Remplacement avec couleurs (&c<3) ---
+    loop split {_colors} at "":
+        set {_c} to loop-value
+        if message contains "&%{_c}%<3":
+            # On vérifie si c'est un <3 isolé ou suivi d'un espace
+            # Cela empêche de transformer &c<30
+            replace all "&%{_c}%<3 " with "&%{_c}%%{_h}% " in message
+            
+            # Si le message se finit exactement par &c<3
+            if message ends with "&%{_c}%<3":
+                replace all "&%{_c}%<3" with "&%{_c}%%{_h}%" in message
+
+    # --- ÉTAPE 2 : Sécurité sur le texte brut (ton commentaire) ---
+    # On remplace seulement s'il y a un espace après ou si c'est la fin du message
+    replace all "<3 " with "%{_h}% " in message
+    
+    if message ends with "<3":
+        # On vérifie qu'il n'y a pas un chiffre juste avant le <3 
+        # pour ne pas casser un calcul type "1<3"
+        if message matches ".*[^0-9]<3$":
+            replace all "<3" with {_h} in message
+        else if message is "<3":
+            set message to {_h}
+
+on hunger meter change:
+    player's name is "Shamallow_" or "Shumecow" 
+    if player's tool is netherite spear:
+        cancel event
+

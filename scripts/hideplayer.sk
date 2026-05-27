@@ -1,0 +1,86 @@
+options:
+    prefix: &7[&6Hide Player&7]&r
+    logging: false
+    loggingstates: true
+
+# Empêche le spam : on ne lance la commande que si l'état change
+function setHiddenState(p: player, state: boolean):
+    if {hidden::%uuid of {_p}%} is {_state}:
+        stop
+    set {hidden::%uuid of {_p}%} to {_state}
+    if {_state} is true:
+        set {_coloredstate} to "&atrue"
+    else:
+        set {_coloredstate} to "&cfalse"
+    send "{@prefix} &7Setting hidden state of &b%{_p}%&7 to %{_coloredstate}%" to console
+    if {_state} is true:
+        execute console command "bplayer hide %{_p}%"
+    else:
+        execute console command "bplayer show %{_p}%"
+
+function updateHideState(p: player):
+    set {_h} to helmet of {_p}
+
+    # Rien sur la tête => show
+    if {_h} is air:
+        setHiddenState({_p}, false)
+        stop
+
+    # Citrouilles => hide
+    if {_h} is carved pumpkin:
+        setHiddenState({_p}, true)
+        stop
+    if {_h} is pumpkin:
+        setHiddenState({_p}, true)
+        stop
+
+    # Tête de joueur => show (exclue)
+    if {_h} is player head:
+        setHiddenState({_p}, false)
+        stop
+
+    # Têtes mobs => hide
+    if {_h} is creeper head:
+        setHiddenState({_p}, true)
+        stop
+    if {_h} is zombie head:
+        setHiddenState({_p}, true)
+        stop
+    if {_h} is skeleton skull:
+        setHiddenState({_p}, true)
+        stop
+    if {_h} is wither skeleton skull:
+        setHiddenState({_p}, true)
+        stop
+    if {_h} is dragon head:
+        setHiddenState({_p}, true)
+        stop
+
+    # Tout le reste => show
+    setHiddenState({_p}, false)
+
+on inventory click:
+    wait 1 tick
+    updateHideState(player)
+
+on inventory drag:
+    wait 1 tick
+    updateHideState(player)
+
+on inventory close:
+    wait 1 tick
+    updateHideState(player)
+
+on join:
+    wait 1 tick
+    updateHideState(player)
+
+on respawn:
+    wait 1 tick
+    updateHideState(player)
+
+on right click:
+    # Beaucoup de serveurs équipent au clic droit (casques / têtes / citrouilles).
+    # On attend 1 tick pour laisser Minecraft faire le swap puis on re-check.
+    wait 1 tick
+    updateHideState(player)

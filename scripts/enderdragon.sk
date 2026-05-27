@@ -1,0 +1,6 @@
+on death of ender dragon:
+    set {_killer} to attacker
+    if {_killer} is a player:
+        broadcast "&5&l[&d&lEnder Dragon&5&l] &r&f%name of {_killer}% &7a tué l'&5Ender Dragon&7 !"
+    else:
+        broadcast "&5&l[&d&lEnder Dragon&5&l] &r&7L'&5Ender Dragon&7 a été tué !"

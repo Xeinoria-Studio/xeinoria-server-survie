@@ -1,0 +1,36 @@
+command /countentity [<number>]:
+    permission: op
+    description: Compte les entités par type dans un rayon donné.
+    usage: /countentity <rayon>
+    trigger:
+        if arg-1 is not set:
+            send "&cUtilisation: /countentity <rayon>" to player
+            stop
+            
+        # Initialisation des variables
+        clear {count::*}
+        set {_total} to 0
+        
+        # Analyse des entités
+        loop all entities in radius arg-1 around player:
+            if loop-entity is not a player:
+                add 1 to {_total}
+                # On récupère le nom du type d'entité (ex: zombie, chicken)
+                set {_type} to type of loop-entity
+                add 1 to {count::%{_type}%}
+        
+        # Affichage des résultats
+        if {_total} is 0:
+            send "&cInformation: Aucune entité trouvée dans un rayon de %arg-1% blocs." to player
+        else:
+            send "&b&l--- Rapport d'Entités (Rayon: %arg-1%m) ---" to player
+            send "&fTotal: &6%{_total}%" to player
+            send ""
+            # On parcourt notre liste pour afficher chaque type trouvé
+            loop {count::*}:
+                # loop-index est le nom de l'entité, loop-value est le nombre
+                send "&e%loop-index%&f: &a%loop-value%" to player
+            send "&b&l---------------------------------------" to player
+        
+        # Nettoyage de la variable liste
+        clear {count::*}
