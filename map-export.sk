@@ -1213,6 +1213,7 @@ function meBuildSettingsMenu(p: player):
     # Lecture config JSON
     set {_blockvpn} to meDlCfgGet("block_vpn")
     set {_blockban} to meDlCfgGet("block_banned")
+    set {_blockunk} to meDlCfgGet("block_unknown")
     set {_capms} to meDlCfgGet("captcha_min_ms") parsed as integer
     if {_capms} is not set:
         set {_capms} to 2500
@@ -1255,6 +1256,15 @@ function meBuildSettingsMenu(p: player):
     set {_cap} to a clock named "&bDelai anti-bot : &f%{_capms}% ms"
     set lore of {_cap} to "&7Temps minimum d'attente apres" and "&7la generation du token captcha." and "&7Valeur : &f%{_capms}% ms (~%{_capdisp}%s)" and "" and "&eClic gauche : +500 ms" and "&eClic droit : -500 ms"
     set slot 15 of {_inv} to {_cap}
+
+    # Slot 16 : block inconnus (aucun pseudo MC connu pour l'IP via LiteBans)
+    if {_blockunk} is "True":
+        set {_lu} to a lever named "&aBlocage inconnus : ACTIVE"
+        set lore of {_lu} to "&7Les IP jamais vues en jeu sont refusees." and "&7L'utilisateur doit d'abord se connecter" and "&7une fois sur play.norath.fr." and "" and "&eClic gauche : &fdesactiver"
+    else:
+        set {_lu} to a redstone torch named "&cBlocage inconnus : DESACTIVE"
+        set lore of {_lu} to "&7Tout le monde peut telecharger, meme" and "&7sans avoir jamais joue sur le serveur." and "" and "&eClic gauche : &factiver"
+    set slot 16 of {_inv} to {_lu}
 
     # Slot 17 : toggle admin auto-whitelist
     set {_aw} to meDlCfgGet("admin_whitelist_enabled")
@@ -2251,6 +2261,18 @@ on inventory click:
         else:
             meDlCfgSet("block_banned", "true")
             send "{@me_prefix} &aBlocage bannis active." to player
+        meBuildSettingsMenu(player)
+        stop
+
+    if {_slot} is 16:
+        # Toggle block_unknown
+        set {_cur} to meDlCfgGet("block_unknown")
+        if {_cur} is "True":
+            meDlCfgSet("block_unknown", "false")
+            send "{@me_prefix} &cBlocage inconnus desactive." to player
+        else:
+            meDlCfgSet("block_unknown", "true")
+            send "{@me_prefix} &aBlocage inconnus active." to player
         meBuildSettingsMenu(player)
         stop
 
