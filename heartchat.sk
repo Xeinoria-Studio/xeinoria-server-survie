@@ -26,8 +26,3 @@ on chat:
         else if message is "<3":
             set message to {_h}
 
-on hunger meter change:
-    player's name is "Shamallow_" or "Shumecow" 
-    if player's tool is netherite spear:
-        cancel event
-
