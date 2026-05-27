@@ -1,0 +1,3 @@
+command /testping:
+    trigger:
+        send "Ping: %ping% ms" to player
