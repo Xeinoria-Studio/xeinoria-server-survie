@@ -1,0 +1,37 @@
+#!===============================================================================
+#! Chorus Craft
+#!===============================================================================
+#! Permet de crafter le bloc "chorus plant" (la tige violette), normalement
+#! NON obtenable en survie (même au silk touch). But : permettre aux joueurs
+#! de réaliser de beaux builds avec ce bloc.
+#!
+#! Équilibrage (volontairement accessible mais maîtrisé) :
+#!  - NON farmable automatiquement : la recette demande de l'END STONE, que le
+#!    joueur doit miner à la main dans l'End (aucune ferme auto ne le produit).
+#!  - NON duplicable : coûte 5 chorus fruits + 1 chorus flower pour 4 chorus
+#!    plants -> on ne récupère jamais plus de ressources qu'on en investit.
+#!  - Accessible : la recette se débloque toute seule dès qu'on ramasse un
+#!    chorus fruit ou une chorus flower (exploration naturelle de l'End).
+#!
+#! Recette (grille 3x3) :
+#!    [ chorus fruit ] [ chorus flower ] [ chorus fruit ]
+#!    [ chorus fruit ] [ chorus fruit  ] [ chorus fruit ]
+#!    [  end stone   ] [   end stone   ] [  end stone   ]
+#!  Résultat : 4x chorus plant
+#!===============================================================================
+
+on load:
+    register new shaped recipe for 4 chorus plant using chorus fruit, chorus flower, chorus fruit, chorus fruit, chorus fruit, chorus fruit, end stone, end stone and end stone with id "xeinoria:chorus_plant"
+
+#! Découverte auto : ramasser une fleur OU un fruit de chorus débloque la
+#! recette dans le livre de recettes du joueur.
+on pickup:
+    if event-item is chorus flower or chorus fruit:
+        if {chorus::discovered::%player's uuid%} is not set:
+            set {chorus::discovered::%player's uuid%} to true
+            discover recipe "xeinoria:chorus_plant" for player
+
+#! Filet : à la connexion, redébloque pour ceux qui l'ont déjà découverte.
+on join:
+    if {chorus::discovered::%player's uuid%} is set:
+        discover recipe "xeinoria:chorus_plant" for player
