@@ -1,0 +1,2075 @@
+#!===============================================================================
+#! Whitelist Manager (Survie) — SOCLE (DB SQLite + migration + cohérence)  [ADMIN]
+#!===============================================================================
+#! Remplace la whitelist vanilla "aveugle" par un système traçant QUI a ajouté
+#! QUI, QUAND et POURQUOI. La whitelist vanilla (whitelist.json) reste le MAÎTRE :
+#! en cas d'incohérence avec la base SQLite, c'est whitelist.json qui gagne.
+#!
+#! Au (re)démarrage / reload :
+#!   1) connexion SQLite + création table
+#!   2) lecture de whitelist.json (source de vérité)
+#!   3) comparaison avec la base : ajoute les manquants, retire les absents
+#!   4) log début/fin + annonce aux admins des changements détectés
+#!
+#! Dépendances : skript-db + driver sqlite-jdbc.jar (dans plugins/ ou libs).
+#!
+#! /!\ DEV : le driver sqlite-jdbc doit être présent (plugins-extra en dev,
+#!     à ajouter en prod). jq n'est PAS requis (parsing JSON en Java).
+#!===============================================================================
+
+import:
+    java.io.File
+    java.io.FileWriter
+    java.nio.file.Files
+    com.google.gson.JsonParser
+    com.google.gson.JsonArray
+    com.google.gson.JsonObject
+    com.google.gson.GsonBuilder
+    java.util.Date
+    java.text.SimpleDateFormat
+    java.net.URI
+    java.io.BufferedReader
+    java.io.InputStreamReader
+    java.lang.Long
+    java.util.UUID
+    org.bukkit.Bukkit
+
+options:
+    perm: admin
+    prefix: &8[&bWhitelist&8]&r
+    # Chemin du fichier whitelist vanilla (maître).
+    wl_json: whitelist.json
+    # Chemin de la base SQLite. IMPORTANT : dans plugins/ et SURTOUT PAS dans scripts/.
+    # scripts/ est versionné/déployé par git -> un 'git pull' écraserait ou supprimerait
+    # la base à chaque mise à jour. plugins/whitelist_manager/ est persistant et hors du
+    # dépôt. Le dossier est créé automatiquement au 1er lancement (cf wlmDB -> mkdirs).
+    db_path: plugins/whitelist_manager/whitelist.db
+    menu_title: &8Whitelist &7» &fSurvie
+    # Textures de têtes (base64) — fournies via command blocks.
+    head_add: eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvMTc3YmI2NmZjNzNhOTdjZWZjYjNhNGJmZGNjYjEyMjgxZjQ0ZGQzMjZjY2QwZmYzOWQ0N2U5ODViZmVmZjM0MyJ9fX0=
+    head_prev: eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvNTMzYWQ1YzIyZGIxNjQzNWRhYWQ2MTU5MGFiYTUxZDkzNzkxNDJkZDU1NmQ2YzQyMmE3MTEwY2EzYWJlYTUwIn19fQ==
+    head_next: eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvOGU0MDNjYzdiYmFjNzM2NzBiZDU0M2Y2YjA5NTViYWU3YjhlOTEyM2Q4M2JkNzYwZjYyMDRjNWFmZDhiZTdlMSJ9fX0=
+    # Tête "?" du sous-menu d'ajout (minecraft-heads.com ID 126343).
+    head_q: eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvMjA4NGVmNjBjNjUwYjRmMjZiMDZiMDUxOTI4MWU2YzQxNjA5YTVjZDllY2JkNjk3YjljZjE2ZWViZjc4NWI0OCJ9fX0=
+    # Tête rouge "-" (retrait) — menus d'action (minecraft-heads.com ID 45310).
+    head_remove: eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvZjhkNWEzOGQ2YmZjYTU5Nzg2NDE3MzM2M2QyODRhOGQzMjljYWFkOTAxOGM2MzgxYjFiNDI5OWI4YjhiOTExYyJ9fX0=
+
+#!===============================================================================
+#! Connexion DB + setup
+#!===============================================================================
+function wlmDB() :: object:
+    if {wlm::db} is not set:
+        # Déploiement "juste le .sk" : SQLite ne crée PAS les dossiers parents.
+        # On crée donc le dossier whitelist_manager/ s'il manque -> module autonome
+        # (drop le .sk sur un serveur neuf et tout se bootstrap tout seul).
+        set {_dbf} to new File("{@db_path}")
+        set {_dbdir} to {_dbf}.getParentFile()
+        if {_dbdir} is set:
+            {_dbdir}.mkdirs()
+        set {wlm::db} to database "jdbc:sqlite:{@db_path}" using a driver "org.sqlite.JDBC"
+    return {wlm::db}
+
+#!===============================================================================
+#! Lecture de whitelist.json (Java/Gson — pas de dépendance jq)
+#! Remplit {wlm::json::*} (clé = uuid, valeur = pseudo) — buffer transitoire,
+#! libéré en fin de wlmSync. Retourne le nombre d'entrées, ou -1 si introuvable.
+#!===============================================================================
+function wlmReadJson() :: number:
+    set {_f} to new File("{@wl_json}")
+    if {_f}.exists() is false:
+        return -1
+    set {_content} to new String(Files.readAllBytes({_f}.toPath()))
+    set {_arr} to JsonParser.parseString({_content}).getAsJsonArray()
+    set {_n} to {_arr}.size()
+    set {_i} to 0
+    delete {wlm::json::*}
+    loop {_n} times:
+        set {_obj} to {_arr}.get({_i}).getAsJsonObject()
+        set {_uuid} to {_obj}.get("uuid").getAsString()
+        set {_name} to {_obj}.get("name").getAsString()
+        set {wlm::json::%{_uuid}%} to {_name}
+        add 1 to {_i}
+    return {_n}
+
+#!===============================================================================
+#! Migration + vérification de cohérence (whitelist.json = maître)
+#!===============================================================================
+function wlmSync():
+    set {_t0} to now
+    send "{@prefix} &7Vérification whitelist en cours..." to console
+
+    # 1) Charger whitelist.json (source de vérité). Si le fichier est introuvable,
+    # on ANNULE : continuer avec un buffer vide viderait toute la base (étape 4).
+    set {_jsonCount} to wlmReadJson()
+    if {_jsonCount} is -1:
+        send "{@prefix} &cwhitelist.json introuvable — synchronisation annulée." to console
+        stop
+
+    # 2) Charger la base actuelle
+    execute "CREATE TABLE IF NOT EXISTS whitelist (uuid TEXT PRIMARY KEY, pseudo TEXT, added_by TEXT, added_date INTEGER, reason TEXT, last_seen INTEGER)" in wlmDB()
+    wait 3 ticks
+    # Migration : colonne 'parent' (uuid du compte principal, vide = principal).
+    # SQLite ignore l'erreur si la colonne existe déjà (on l'enveloppe).
+    execute "ALTER TABLE whitelist ADD COLUMN parent TEXT DEFAULT ''" in wlmDB()
+    wait 3 ticks
+    # Migration : colonne 'skin' (texture base64 mise en cache, vide = pas encore).
+    execute "ALTER TABLE whitelist ADD COLUMN skin TEXT DEFAULT ''" in wlmDB()
+    wait 3 ticks
+    # IMPORTANT : vider la variable AVANT le SELECT (skript-db ne l'écrase pas
+    # si la requête ne renvoie aucune ligne -> sinon on garde un vieux résultat).
+    delete {_db::*}
+    execute "SELECT uuid, pseudo FROM whitelist" in wlmDB() and store the result in {_db::*}
+    wait 5 ticks
+    delete {wlm::dbset::*}
+    if {_db::uuid::*} is set:
+        loop {_db::uuid::*}:
+            set {_dbu} to loop-value
+            set {wlm::dbset::%{_dbu}%} to true
+
+    set {_added} to 0
+    set {_removed} to 0
+    delete {wlm::addedNames::*}
+    delete {wlm::removedNames::*}
+
+    # 3) AJOUTS : présents dans json mais absents de la base
+    #    (skript-db transforme les %...% en paramètres préparés sécurisés :
+    #     pas de guillemets SQL autour des expressions !)
+    set {_ts} to unix timestamp of now
+    loop {wlm::json::*}:
+        set {_u} to loop-index
+        set {_name} to loop-value
+        if {wlm::dbset::%{_u}%} is not set:
+            execute "INSERT OR IGNORE INTO whitelist (uuid, pseudo, added_by, added_date, reason, last_seen) VALUES (%{_u}%, %{_name}%, 'migration', %{_ts}%, 'Importé depuis whitelist.json', 0)" in wlmDB()
+            add 1 to {_added}
+            add {_name} to {wlm::addedNames::*}
+        else:
+            # Déjà présent : on resynchronise le pseudo depuis le json (maître).
+            # Répare au passage un éventuel pseudo corrompu (composant Adventure).
+            execute "UPDATE whitelist SET pseudo = %{_name}% WHERE uuid = %{_u}%" in wlmDB()
+
+    # 4) RETRAITS : présents dans la base mais absents de json (json = maître)
+    if {_db::uuid::*} is set:
+        loop {_db::uuid::*}:
+            set {_du} to loop-value
+            if {wlm::json::%{_du}%} is not set:
+                set {_dname} to {_db::pseudo::%loop-index%}
+                execute "DELETE FROM whitelist WHERE uuid = %{_du}%" in wlmDB()
+                add 1 to {_removed}
+                add {_dname} to {wlm::removedNames::*}
+
+    wait 5 ticks
+    set {_elapsed} to difference between {_t0} and now
+    send "{@prefix} &aVérification terminée &7en %{_elapsed}% &8| &7json: &f%{_jsonCount}%&7, ajoutés: &a%{_added}%&7, retirés: &c%{_removed}%" to console
+
+    # 5) Annonce aux admins si changements
+    if {_added} > 0:
+        wlmAnnounceAdmins("&a+ %{_added}% joueur(s) ajouté(s) depuis whitelist.json : &f%{wlm::addedNames::*}%")
+    if {_removed} > 0:
+        wlmAnnounceAdmins("&c- %{_removed}% joueur(s) retiré(s) (absents de whitelist.json) : &f%{wlm::removedNames::*}%")
+
+    # 6) Libère les buffers de sync : tout est recalculé à chaque passage, inutile
+    # de laisser ~70 entrées traîner dans variables.csv entre deux syncs.
+    delete {wlm::json::*}
+    delete {wlm::dbset::*}
+    delete {wlm::addedNames::*}
+    delete {wlm::removedNames::*}
+
+function wlmAnnounceAdmins(msg: text):
+    loop all players:
+        if loop-player has permission "{@perm}":
+            send "{@prefix} %{_msg}%" to loop-player
+
+#!===============================================================================
+#! Déclencheurs : démarrage / reload
+#!===============================================================================
+on load:
+    # Libère l'état de SESSION hérité (Skript persiste les variables globales dans
+    # variables.csv) : menus ouverts, contextes d'action, caches d'affichage,
+    # résultats transitoires. Tout est reconstruit à l'usage — sans cette purge,
+    # un crash laisserait des inventaires fantômes et des caches morts à vie.
+    delete {wlm::menus::*}
+    delete {wlm::addmenus::*}
+    delete {wlm::actmenus::*}
+    delete {wlm::openinv::*}
+    delete {wlm::slotname::*}
+    delete {wlm::slotgroup::*}
+    delete {wlm::act::*}
+    delete {wlm::aslot::*}
+    delete {wlm::actawait::*}
+    delete {wlm::grp::*}
+    delete {wlm::grpnames::*}
+    delete {wlm::grpuuids::*}
+    delete {wlm::grpskins::*}
+    delete {wlm::grplastseen::*}
+    delete {wlm::r::*}
+    delete {wlm::q::*}
+    delete {wlm::gh::*}
+    # Désactive la commande whitelist VANILLA (enlève le rouge + le conflit).
+    # On retire seulement "whitelist" du CommandMap ; "minecraft:whitelist" reste
+    # (backend de nos add/remove).
+    set {_cmap} to Bukkit.getServer().getCommandMap()
+    set {_vanilla} to {_cmap}.getCommand("whitelist")
+    if {_vanilla} is set:
+        if "%{_vanilla}%" contains "VanillaCommandWrapper":
+            {_vanilla}.unregister({_cmap})
+            send "{@prefix} &7Commande whitelist vanilla désactivée (remplacée)." to console
+    # Petit délai pour laisser le serveur + skript-db s'initialiser.
+    wait 2 seconds
+    # Réinitialise la connexion DB à chaque (re)chargement (évite un handle mort
+    # si le fichier .db a été recréé/déplacé entre deux reloads).
+    delete {wlm::db}
+    wlmSync()
+    # Le cache du tab est une variable globale -> il SURVIT au redémarrage. On le
+    # vide à chaque (re)chargement pour qu'il se reconstruise depuis la base (sinon
+    # un joueur retiré par wlmSync resterait dans le tab après un reboot).
+    wlmInvalidateTabCache()
+    # Préchargement des skins manquants au lancement : remplit le cache base64 en
+    # base (1 skin/seconde via le timer plus bas), pour que le menu s'affiche depuis
+    # le cache (zéro appel Mojang à l'ouverture -> pas de rafale 429).
+    wait 30 seconds
+    wlmPreloadSkins()
+
+#!===============================================================================
+#! Tracking dernière connexion
+#!===============================================================================
+on join:
+    set {_u} to "%uuid of player%"
+    # "%...%" force la conversion en string : player's name peut renvoyer un
+    # composant Adventure (sinon skript-db stocke son toString -> pseudo corrompu).
+    set {_name} to "%player's name%"
+    set {_ts} to unix timestamp of now
+    # Match par UUID OU par pseudo : en dev offline-mode, l'UUID du joueur (offline,
+    # bidon) ne correspond PAS à l'UUID des records migrés (vrai UUID du whitelist.json).
+    # Le match par pseudo garantit la mise à jour de last_seen dans les deux cas.
+    # (En prod online-mode, l'UUID matche directement.)
+    execute "UPDATE whitelist SET last_seen = %{_ts}%, pseudo = %{_name}% WHERE uuid = %{_u}% OR pseudo = %{_name}%" in wlmDB()
+    # Rafraîchit le skin en cache à la connexion (capte un changement de skin) :
+    # on lève le verrou puis on remet en file (fetch 1/seconde, non bloquant).
+    delete {wlm::skinfetched::%{_u}%}
+    wlmCacheSkinAsync({_u}, {_name})
+
+# À la DÉCONNEXION : on enregistre last_seen = MAINTENANT (l'heure où il part).
+# Sinon last_seen resterait figé à l'heure de connexion -> "il y a 15 min" juste
+# après s'être déco alors qu'il était là il y a 2 secondes. Là c'est "vu il y a X"
+# depuis son départ. (Pendant qu'il est en ligne, le menu affiche "En ligne".)
+on quit:
+    set {_u} to "%uuid of player%"
+    set {_name} to "%player's name%"
+    set {_ts} to unix timestamp of now
+    execute "UPDATE whitelist SET last_seen = %{_ts}%, pseudo = %{_name}% WHERE uuid = %{_u}% OR pseudo = %{_name}%" in wlmDB()
+    # Libère l'état de session du joueur qui part (contextes de menus/actions).
+    # {wlm::sort}/{wlm::page} sont gardés : ce sont ses préférences d'affichage.
+    delete {wlm::act::%{_u}%::*}
+    delete {wlm::aslot::%{_u}%::*}
+    delete {wlm::actawait::%{_u}%::*}
+    delete {wlm::openinv::%{_u}%}
+    delete {wlm::slotname::%{_u}%::*}
+    delete {wlm::slotgroup::%{_u}%::*}
+
+#!===============================================================================
+#! RÉSOLUTION BIDIRECTIONNELLE pseudo <-> UUID (Java ET Bedrock)
+#! Tu peux donner SOIT un pseudo, SOIT un UUID : on retrouve l'autre automatiquement.
+#! Remplit 4 variables :
+#!   {wlm::r::ok} (true/false), {wlm::r::uuid}, {wlm::r::pseudo}, {wlm::r::bedrock}
+#!  - pseudo Java -> uuid via offline player.
+#!  - pseudo Bedrock (".") -> XUID via GeyserMC -> UUID Floodgate.
+#!  - UUID Floodgate (00000000-...) -> XUID -> gamertag via GeyserMC -> ".pseudo".
+#!  - UUID Java -> nom via Mojang sessionserver.
+#! (Bloquant pour les appels HTTP -> action admin ponctuelle, ok.)
+#!
+#! NB — pattern "variables transitoires" ({wlm::r::*}, {wlm::q::*}, {wlm::gh::*}) :
+#! une fonction Skript contenant un wait ne peut pas retourner de valeur, les
+#! résultats passent donc par ces variables, lues PUIS LIBÉRÉES par l'appelant.
+#! Limite assumée : deux admins dont les commandes se croisent à quelques ticks
+#! près partagent cet état (dernier écrit gagne) — improbable et sans corruption.
+#!===============================================================================
+function wlmResolve(input: text):
+    delete {wlm::r::uuid}
+    delete {wlm::r::pseudo}
+    set {wlm::r::ok} to false
+    set {wlm::r::bedrock} to false
+    set {_in} to {_input}
+    # --- L'entrée est un UUID (contient "-") : on INVERSE pour retrouver le pseudo
+    if {_in} contains "-":
+        set {_nodash} to {_in}
+        replace all "-" with "" in {_nodash}
+        if {_in} starts with "00000000-0000-0000-":
+            # UUID Floodgate -> XUID (16 hex bas) -> gamertag via GeyserMC
+            set {_xhex} to last 16 characters of {_nodash}
+            set {_xuid} to Long.parseLong({_xhex}, 16)
+            set {_json} to wlmHttpGet("https://api.geysermc.org/v2/xbox/gamertag/%{_xuid}%")
+            if {_json} is "":
+                stop
+            set {_obj} to JsonParser.parseString({_json}).getAsJsonObject()
+            if {_obj}.has("gamertag") is not true:
+                stop
+            set {_gt} to {_obj}.get("gamertag").getAsString()
+            replace all " " with "_" in {_gt}
+            set {wlm::r::uuid} to {_in}
+            set {wlm::r::pseudo} to ".%{_gt}%"
+            set {wlm::r::bedrock} to true
+            set {wlm::r::ok} to true
+            stop
+        else:
+            # UUID Java -> nom via Mojang
+            set {_json} to wlmHttpGet("https://sessionserver.mojang.com/session/minecraft/profile/%{_nodash}%")
+            if {_json} is "":
+                stop
+            set {_obj} to JsonParser.parseString({_json}).getAsJsonObject()
+            if {_obj}.has("name") is not true:
+                stop
+            set {wlm::r::uuid} to {_in}
+            set {wlm::r::pseudo} to {_obj}.get("name").getAsString()
+            set {wlm::r::ok} to true
+            stop
+    # --- L'entrée est un PSEUDO Bedrock (".") : gamertag -> XUID -> UUID Floodgate
+    if {_in} starts with ".":
+        set {_g} to subtext of {_in} from characters 2 to (length of {_in})
+        replace all "_" with " " in {_g}
+        replace all " " with "%%20" in {_g}
+        set {_json} to wlmHttpGet("https://api.geysermc.org/v2/xbox/xuid/%{_g}%")
+        if {_json} is "":
+            stop
+        set {_obj} to JsonParser.parseString({_json}).getAsJsonObject()
+        if {_obj}.has("xuid") is not true:
+            stop
+        set {_xuid} to {_obj}.get("xuid").getAsLong()
+        set {_hex} to Long.toHexString({_xuid})
+        set {_hex} to last 16 characters of "0000000000000000%{_hex}%"
+        set {wlm::r::uuid} to "00000000-0000-0000-%subtext of {_hex} from characters 1 to 4%-%subtext of {_hex} from characters 5 to 16%"
+        set {wlm::r::pseudo} to {_in}
+        set {wlm::r::bedrock} to true
+        set {wlm::r::ok} to true
+        stop
+    # --- Pseudo Java
+    set {_off} to {_in} parsed as offline player
+    if {_off} is not set:
+        stop
+    set {wlm::r::uuid} to "%uuid of {_off}%"
+    set {wlm::r::pseudo} to {_in}
+    set {wlm::r::ok} to true
+
+#!===============================================================================
+#! ÉCRITURE DIRECTE de whitelist.json (pour les Bedrock : la commande vanilla
+#! whitelist add/remove ne sait pas gérer un UUID Floodgate -> elle le hash en
+#! UUID offline. On écrit donc l'entrée {uuid, name} nous-mêmes via Gson, puis on
+#! recharge la whitelist vanilla. On n'ajoute/retire QUE des entrées, jamais on ne
+#! supprime le fichier.
+#!===============================================================================
+function wlmJsonAddBedrock(uuid: text, name: text):
+    set {_pf} to new File("{@wl_json}")
+    if {_pf}.exists() is false:
+        stop
+    set {_content} to new String(Files.readAllBytes({_pf}.toPath()))
+    set {_arr} to JsonParser.parseString({_content}).getAsJsonArray()
+    set {_u} to {_uuid}
+    set {_sz} to {_arr}.size()
+    set {_i} to 0
+    loop {_sz} times:
+        set {_eu} to {_arr}.get({_i}).getAsJsonObject().get("uuid").getAsString()
+        if "%{_eu}%" is "%{_u}%":
+            stop
+        add 1 to {_i}
+    set {_obj} to new JsonObject()
+    {_obj}.addProperty("uuid", {_u})
+    {_obj}.addProperty("name", {_name})
+    {_arr}.add({_obj})
+    set {_gb} to new GsonBuilder()
+    {_gb}.setPrettyPrinting()
+    set {_g} to {_gb}.create()
+    set {_out} to {_g}.toJson({_arr})
+    # Écriture DIRECTE (in-place). PAS de temp+rename : whitelist.json est un
+    # bind-mount Docker d'un fichier unique -> un rename dessus échoue ("Device or
+    # resource busy"). FileWriter écrit dans l'inode existant -> OK.
+    set {_w} to new FileWriter({_pf})
+    {_w}.write({_out})
+    {_w}.close()
+    execute console command "minecraft:whitelist reload"
+
+#!===============================================================================
+#! AJOUT / RETRAIT (DB + whitelist vanilla via minecraft: pour éviter la boucle)
+#!  (Le retrait du json passe par Bukkit setWhitelisted(false), natif par UUID.)
+#!===============================================================================
+function wlmAddPlayer(admin: player, target: text, reason: text):
+    # Résolution bidirectionnelle : tu peux donner un PSEUDO OU un UUID.
+    wlmResolve({_target})
+    if {wlm::r::ok} is not true:
+        delete {wlm::r::*}
+        send "{@prefix} &cIntrouvable : &f%{_target}% &7(pseudo/UUID invalide, ou Bedrock absent de GeyserMC)." to {_admin}
+        stop
+    set {_uuid} to {wlm::r::uuid}
+    set {_pseudo} to {wlm::r::pseudo}
+    set {_bed} to {wlm::r::bedrock}
+    delete {wlm::r::*}
+    # Déjà whitelisté ?
+    execute "SELECT uuid FROM whitelist WHERE uuid = %{_uuid}%" in wlmDB() and store the result in {_chk::*}
+    wait 5 ticks
+    if {_chk::uuid::*} is set:
+        send "{@prefix} &e%{_pseudo}% &7est déjà dans la whitelist." to {_admin}
+        stop
+    set {_r} to {_reason}
+    if {_r} is "":
+        set {_r} to "pas de commentaire"
+    set {_by} to "Console"
+    if {_admin} is set:
+        set {_by} to "%{_admin}%"
+    set {_ts} to unix timestamp of now
+    execute "INSERT OR REPLACE INTO whitelist (uuid, pseudo, added_by, added_date, reason, last_seen) VALUES (%{_uuid}%, %{_pseudo}%, %{_by}%, %{_ts}%, %{_r}%, 0)" in wlmDB()
+    # Whitelist vanilla : Bedrock -> écriture directe du json {uuid, .nom} (la commande
+    # vanilla hash le nom/uuid en offline) ; Java -> commande par nom.
+    if {_bed} is true:
+        wlmJsonAddBedrock({_uuid}, {_pseudo})
+    else:
+        execute console command "minecraft:whitelist add %{_pseudo}%"
+    wlmInvalidateTabCache()
+    send "{@prefix} &a%{_pseudo}% &7ajouté par &b%{_by}%&7. Raison : &f%{_r}%" to {_admin}
+
+function wlmRemovePlayer(admin: player, target: text):
+    set {_tname} to {_target}
+    # On accepte pseudo OU uuid : on récupère l'UUID + le pseudo RÉELS depuis la base.
+    execute "SELECT uuid, pseudo FROM whitelist WHERE pseudo = %{_tname}% OR uuid = %{_tname}%" in wlmDB() and store the result in {_chk::*}
+    wait 5 ticks
+    if {_chk::uuid::*} is not set:
+        send "{@prefix} &e%{_target}% &7n'est pas dans la whitelist." to {_admin}
+        stop
+    set {_uuid} to {_chk::uuid::1}
+    set {_dpseudo} to {_chk::pseudo::1}
+    # Si on retire un PRINCIPAL qui a des alts, ses alts redeviennent principaux.
+    execute "UPDATE whitelist SET parent = '' WHERE parent = %{_uuid}%" in wlmDB()
+    execute "DELETE FROM whitelist WHERE uuid = %{_uuid}%" in wlmDB()
+    # Retrait de la whitelist vanilla PAR UUID via l'API Bukkit (natif : écrit
+    # whitelist.json comme vanilla -> OK sur le bind-mount, met à jour la mémoire,
+    # pas de reload). Marche pour Java ET Bedrock, robuste quel que soit le nom/mode.
+    set {_offrm} to Bukkit.getOfflinePlayer(UUID.fromString({_uuid}))
+    {_offrm}.setWhitelisted(false)
+    wlmInvalidateTabCache()
+    send "{@prefix} &c%{_dpseudo}% &7retiré de la whitelist." to {_admin}
+
+#!===============================================================================
+#! LIAISON DE COMPTES (alts) — système manuel
+#!  parent = '' -> compte PRINCIPAL ; parent = uuid -> alt de ce principal.
+#!  Règle : on ne lie QU'À un principal (le parent du groupe).
+#!===============================================================================
+# Récupère le statut d'un joueur en base. Remplit des variables {wlm::q::*} :
+#   exists (true/false), uuid, parent. Procédure (async).
+function wlmQuery(target: text):
+    delete {wlm::q::exists}
+    delete {wlm::q::uuid}
+    delete {wlm::q::parent}
+    delete {_q::*}
+    # skript-db : un paramètre de fonction ne se lie PAS comme placeholder dans
+    # execute -> on le copie d'abord dans une variable locale.
+    set {_t} to {_target}
+    execute "SELECT uuid, parent FROM whitelist WHERE pseudo = %{_t}%" in wlmDB() and store the result in {_q::*}
+    wait 3 ticks
+    if {_q::uuid::*} is set:
+        set {wlm::q::exists} to true
+        set {wlm::q::uuid} to {_q::uuid::1}
+        # Normalise parent : NULL/<none> -> "" (chaîne vide = compte principal)
+        if {_q::parent::1} is set:
+            set {wlm::q::parent} to {_q::parent::1}
+        else:
+            set {wlm::q::parent} to ""
+    else:
+        set {wlm::q::exists} to false
+
+# /whitelist add alt <altPseudo> <principalPseudo> : ajoute l'alt ET le lie.
+# Pas de raison : un alt reçoit automatiquement "Double compte de: <principal>".
+function wlmAddAlt(admin: player, altName: text, mainName: text):
+    # Le principal : on accepte pseudo OU uuid -> on le résout en pseudo, puis on
+    # vérifie qu'il existe et que c'est un VRAI principal.
+    wlmResolve({_mainName})
+    if {wlm::r::ok} is not true:
+        delete {wlm::r::*}
+        send "{@prefix} &cCompte principal introuvable : &f%{_mainName}%&c." to {_admin}
+        stop
+    set {_mainPseudo} to {wlm::r::pseudo}
+    delete {wlm::r::*}
+    wlmQuery({_mainPseudo})
+    wait 5 ticks
+    if {wlm::q::exists} is not true:
+        send "{@prefix} &cLe compte principal &f%{_mainPseudo}% &cn'est pas dans la whitelist." to {_admin}
+        stop
+    if {wlm::q::parent} is not "":
+        send "{@prefix} &c%{_mainPseudo}% &cest déjà un alt. Lie plutôt au compte principal du groupe." to {_admin}
+        stop
+    set {_mainUuid} to {wlm::q::uuid}
+    delete {wlm::q::*}
+    # Limite : 10 double-comptes maximum par groupe.
+    delete {_cnt::*}
+    execute "SELECT uuid FROM whitelist WHERE parent = %{_mainUuid}%" in wlmDB() and store the result in {_cnt::*}
+    wait 3 ticks
+    if {_cnt::uuid::*} is set:
+        if size of {_cnt::uuid::*} >= 10:
+            send "{@prefix} &cLimite atteinte : &f%{_mainPseudo}%&c a déjà 10 double-comptes (maximum)." to {_admin}
+            stop
+    # L'alt : on accepte pseudo OU uuid -> résolution bidirectionnelle.
+    wlmResolve({_altName})
+    if {wlm::r::ok} is not true:
+        delete {wlm::r::*}
+        send "{@prefix} &cDouble compte introuvable : &f%{_altName}% &7(pseudo/UUID invalide, ou Bedrock absent de GeyserMC)." to {_admin}
+        stop
+    set {_altUuid} to {wlm::r::uuid}
+    set {_altPseudo} to {wlm::r::pseudo}
+    set {_altBed} to {wlm::r::bedrock}
+    delete {wlm::r::*}
+    if {_altUuid} is {_mainUuid}:
+        send "{@prefix} &cUn compte ne peut pas être son propre double compte." to {_admin}
+        stop
+    # L'alt ne doit pas déjà exister (par uuid)
+    delete {_chk::*}
+    execute "SELECT uuid FROM whitelist WHERE uuid = %{_altUuid}%" in wlmDB() and store the result in {_chk::*}
+    wait 5 ticks
+    if {_chk::uuid::*} is set:
+        send "{@prefix} &e%{_altPseudo}% &7existe déjà. Utilise &f/whitelist merge %{_altPseudo}% %{_mainPseudo}%&7." to {_admin}
+        stop
+    # Raison automatique pour un alt (pas de commentaire à saisir).
+    set {_r} to "Double compte de: %{_mainPseudo}%"
+    set {_by} to "Console"
+    if {_admin} is set:
+        set {_by} to "%{_admin}%"
+    set {_ts} to unix timestamp of now
+    execute "INSERT OR REPLACE INTO whitelist (uuid, pseudo, added_by, added_date, reason, last_seen, parent) VALUES (%{_altUuid}%, %{_altPseudo}%, %{_by}%, %{_ts}%, %{_r}%, 0, %{_mainUuid}%)" in wlmDB()
+    # Bedrock -> écriture directe du json {uuid, .nom} ; Java -> commande par nom.
+    if {_altBed} is true:
+        wlmJsonAddBedrock({_altUuid}, {_altPseudo})
+    else:
+        execute console command "minecraft:whitelist add %{_altPseudo}%"
+    wlmInvalidateTabCache()
+    send "{@prefix} &a%{_altPseudo}% &7ajouté comme double compte de &b%{_mainPseudo}%&7." to {_admin}
+
+# /whitelist merge <altPseudo> <principalPseudo> : lie un compte existant.
+function wlmMerge(admin: player, altName: text, mainName: text):
+    # NB : wlmQuery contient un wait -> on attend après chaque appel sinon on lit
+    # le résultat avant qu'il soit prêt (fonctions Skript délayées = async).
+    wlmQuery({_mainName})
+    wait 5 ticks
+    if {wlm::q::exists} is not true:
+        send "{@prefix} &cLe compte principal &f%{_mainName}% &cn'est pas dans la whitelist." to {_admin}
+        stop
+    if {wlm::q::parent} is not "":
+        send "{@prefix} &c%{_mainName}% &cest déjà un alt. Lie plutôt au compte principal du groupe." to {_admin}
+        stop
+    set {_mainUuid} to {wlm::q::uuid}
+    delete {wlm::q::*}
+    # Limite : 10 double-comptes maximum par groupe.
+    delete {_cnt::*}
+    execute "SELECT uuid FROM whitelist WHERE parent = %{_mainUuid}%" in wlmDB() and store the result in {_cnt::*}
+    wait 3 ticks
+    if {_cnt::uuid::*} is set:
+        if size of {_cnt::uuid::*} >= 10:
+            send "{@prefix} &cLimite atteinte : ce groupe a déjà 10 double-comptes (maximum)." to {_admin}
+            stop
+    wlmQuery({_altName})
+    wait 5 ticks
+    if {wlm::q::exists} is not true:
+        send "{@prefix} &c%{_altName}% &cn'est pas dans la whitelist. Utilise &f/whitelist add alt&c." to {_admin}
+        stop
+    set {_altUuid} to {wlm::q::uuid}
+    set {_altParent} to {wlm::q::parent}
+    delete {wlm::q::*}
+    if {_altUuid} is {_mainUuid}:
+        send "{@prefix} &cUn compte ne peut pas être son propre alt." to {_admin}
+        stop
+    if {_altParent} is not "":
+        send "{@prefix} &e%{_altName}% &7est déjà un alt. Fais d'abord &f/whitelist unmerge %{_altName}%&7." to {_admin}
+        stop
+    # L'alt ne doit pas être lui-même un principal avec des alts
+    delete {_kids::*}
+    execute "SELECT pseudo FROM whitelist WHERE parent = %{_altUuid}%" in wlmDB() and store the result in {_kids::*}
+    wait 3 ticks
+    if {_kids::pseudo::*} is set:
+        send "{@prefix} &c%{_altName}% &cest un compte principal avec des alts. Délie-les d'abord." to {_admin}
+        stop
+    execute "UPDATE whitelist SET parent = %{_mainUuid}% WHERE uuid = %{_altUuid}%" in wlmDB()
+    wlmInvalidateTabCache()
+    send "{@prefix} &b%{_altName}% &7rejoint le groupe de &a%{_mainName}%&7." to {_admin}
+
+# /whitelist unmerge <pseudo> : délie un alt -> redevient principal.
+function wlmUnmerge(admin: player, target: text):
+    wlmQuery({_target})
+    wait 5 ticks
+    if {wlm::q::exists} is not true:
+        send "{@prefix} &c%{_target}% &cn'est pas dans la whitelist." to {_admin}
+        stop
+    if {wlm::q::parent} is "":
+        send "{@prefix} &e%{_target}% &7est déjà un compte principal." to {_admin}
+        stop
+    set {_au} to {wlm::q::uuid}
+    delete {wlm::q::*}
+    execute "UPDATE whitelist SET parent = '' WHERE uuid = %{_au}%" in wlmDB()
+    wlmInvalidateTabCache()
+    send "{@prefix} &b%{_target}% &7délié — c'est de nouveau un compte principal." to {_admin}
+
+#!===============================================================================
+#! GROUPES — membres d'un groupe (principal + ses alts) pour l'affichage stacké.
+#!===============================================================================
+#  Les alts sont préchargés en masse dans wlmFillMenu (1 requête) :
+#    {wlm::grpnames::%parentUuid%::*} et {wlm::grpuuids::%parentUuid%::*}.
+
+#!===============================================================================
+#! SKINS — cache base64 en base + fetch Mojang throttlé (1/seconde)
+#!===============================================================================
+#! On affiche les têtes DEPUIS le cache base64 (colonne skin) -> ZÉRO appel Mojang
+#! à l'ouverture du menu (donc pas de rafale 429). Les skins manquants sont mis en
+#! file et récupérés 1/seconde en arrière-plan (préchargement au lancement +
+#! refresh on-join). Une fois en cache, c'est permanent (survit reboot).
+
+# Requête HTTP GET basique, renvoie le corps texte (ou "" si échec).
+function wlmHttpGet(url: text) :: text:
+    set {_u} to {_url}
+    set {_uri} to new URI({_u})
+    set {_conn} to {_uri}.toURL().openConnection()
+    {_conn}.setRequestProperty("User-Agent", "xeinoria-wlm")
+    {_conn}.setConnectTimeout(4000)
+    {_conn}.setReadTimeout(4000)
+    set {_code} to {_conn}.getResponseCode()
+    if {_code} is not 200:
+        return ""
+    set {_br} to new BufferedReader(new InputStreamReader({_conn}.getInputStream()))
+    set {_out} to ""
+    loop 9999 times:
+        set {_line} to {_br}.readLine()
+        if {_line} is not set:
+            exit loop
+        set {_out} to "%{_out}%%{_line}%"
+    {_br}.close()
+    return {_out}
+
+# Vrai si le pseudo est un joueur Bedrock (préfixe Floodgate "."), donc sans
+# skin Mojang -> on ne tente même pas l'appel.
+function wlmIsBedrock(pseudo: text) :: boolean:
+    if {_pseudo} starts with ".":
+        return true
+    return false
+
+# Récupère la texture base64 d'un pseudo via Mojang. "" si introuvable (cracked,
+# Bedrock, pseudo invalide...). Bloquant -> appelé par le timer 1/seconde.
+function wlmFetchSkinTexture(pseudo: text) :: text:
+    set {_p} to {_pseudo}
+    if wlmIsBedrock({_p}) is true:
+        return ""
+    set {_j1} to wlmHttpGet("https://api.mojang.com/users/profiles/minecraft/%{_p}%")
+    if {_j1} is "":
+        return ""
+    set {_uuid} to JsonParser.parseString({_j1}).getAsJsonObject().get("id").getAsString()
+    set {_j2} to wlmHttpGet("https://sessionserver.mojang.com/session/minecraft/profile/%{_uuid}%")
+    if {_j2} is "":
+        return ""
+    set {_props} to JsonParser.parseString({_j2}).getAsJsonObject().get("properties").getAsJsonArray()
+    if {_props}.size() < 1:
+        return ""
+    return {_props}.get(0).getAsJsonObject().get("value").getAsString()
+
+# Empile un joueur dans la file de récupération de skin (non bloquant).
+function wlmCacheSkinAsync(uuid: text, pseudo: text):
+    if {wlm::skinfetched::%{_uuid}%} is set:
+        stop
+    if wlmIsBedrock({_pseudo}) is true:
+        set {wlm::skinfetched::%{_uuid}%} to true
+        stop
+    set {wlm::skinfetched::%{_uuid}%} to true
+    set {wlm::skinqueue::%{_uuid}%} to {_pseudo}
+
+# Récupère + met en cache le skin d'UN joueur (bloquant -> appelé par le timer).
+function wlmDoCacheSkin(uuid: text, pseudo: text):
+    set {_tex} to wlmFetchSkinTexture({_pseudo})
+    wait 1 tick
+    if {_tex} is not "":
+        set {_u} to {_uuid}
+        execute "UPDATE whitelist SET skin = %{_tex}% WHERE uuid = %{_u}%" in wlmDB()
+    else:
+        # Échec (429 / timeout) -> on lève le verrou pour que le prochain
+        # préchargement (reload/restart) réessaie. Évite les trous permanents si
+        # l'IP est temporairement rate-limitée par Mojang.
+        if wlmIsBedrock({_pseudo}) is not true:
+            delete {wlm::skinfetched::%{_uuid}%}
+
+# Préchargement au lancement : empile tous les skins manquants (silencieux console).
+function wlmPreloadSkins():
+    delete {_r::*}
+    execute "SELECT uuid, pseudo FROM whitelist WHERE skin = '' OR skin IS NULL" in wlmDB() and store the result in {_r::*}
+    wait 5 ticks
+    set {_n} to 0
+    if {_r::uuid::*} is set:
+        loop {_r::uuid::*}:
+            set {_uu} to loop-value
+            set {_pp} to {_r::pseudo::%loop-index%}
+            wlmCacheSkinAsync({_uu}, {_pp})
+            add 1 to {_n}
+    send "{@prefix} &7Préchargement skins : &f%{_n}% &7en file (~1/seconde)." to console
+
+# Empile les joueurs pour récupération de skin.
+#  force=false : seulement ceux SANS skin en cache. force=true : TOUS (re-fetch).
+function wlmRefreshAllSkins(admin: player, force: boolean):
+    delete {_r::*}
+    if {_force} is true:
+        execute "SELECT uuid, pseudo FROM whitelist" in wlmDB() and store the result in {_r::*}
+    else:
+        execute "SELECT uuid, pseudo FROM whitelist WHERE skin = '' OR skin IS NULL" in wlmDB() and store the result in {_r::*}
+    wait 5 ticks
+    set {_n} to 0
+    if {_r::uuid::*} is set:
+        set {_n} to size of {_r::uuid::*}
+        loop {_r::uuid::*}:
+            set {_uu} to loop-value
+            set {_pp} to {_r::pseudo::%loop-index%}
+            delete {wlm::skinfetched::%{_uu}%}
+            wlmCacheSkinAsync({_uu}, {_pp})
+    if {_force} is true:
+        send "{@prefix} &a%{_n}% &7skin(s) en re-récupération FORCÉE (~1/seconde)." to {_admin}
+    else:
+        send "{@prefix} &a%{_n}% &7skin(s) manquant(s) en file (~1/seconde)." to {_admin}
+
+# Construit une tête : depuis le cache base64 si dispo (instantané, zéro Mojang),
+# sinon tête Steve + mise en file pour récupération en arrière-plan (1/seconde).
+function wlmMemberHead(uuid: text, name: text, skin: text) :: item:
+    set {_h} to player head
+    if {_skin} is not "":
+        apply profile component to {_h}:
+            texture-value: {_skin}
+    else:
+        wlmCacheSkinAsync({_uuid}, {_name})
+    return {_h}
+
+
+# Échappe les caractères qui casseraient une balise MiniMessage (< et ').
+function wlmMM(t: text) :: text:
+    set {_s} to {_t}
+    replace all "<" with "" in {_s}
+    replace all "'" with "" in {_s}
+    return {_s}
+
+# Reconstruit le texte des arguments à partir de l'index {_from} exclu
+# (ex : la raison d'un ban = tout ce qui suit le pseudo). "" si rien.
+function wlmJoinArgs(args: texts, from: number) :: text:
+    set {_out} to ""
+    loop {_args::*}:
+        if loop-index parsed as number > {_from}:
+            if {_out} is "":
+                set {_out} to "%loop-value%"
+            else:
+                set {_out} to "%{_out}% %loop-value%"
+    return {_out}
+
+# Liste paginée dans le chat (15/page), cliquable via MiniMessage.
+# Marque tous les joueurs EN LIGNE comme "vus maintenant" (last_seen = now).
+# Appelé avant chaque affichage liste/menu -> un joueur connecté trie TOUJOURS en
+# tête (sinon un joueur déco il y a 1s passerait au-dessus d'un connecté).
+function wlmTouchOnline():
+    set {_lts} to unix timestamp of now
+    loop all players:
+        set {_lu} to "%uuid of loop-player%"
+        set {_ln} to "%name of loop-player%"
+        execute "UPDATE whitelist SET last_seen = %{_lts}% WHERE uuid = %{_lu}% OR pseudo = %{_ln}%" in wlmDB()
+    # On laisse le temps aux UPDATE async de s'écrire AVANT le SELECT de tri.
+    wait 15 ticks
+
+function wlmListText(admin: player, page: number):
+    wlmTouchOnline()
+    delete {_r::*}
+    # Tri par connexion la plus récente d'abord (joueurs actifs en haut).
+    execute "SELECT pseudo, added_by, added_date, reason, last_seen FROM whitelist ORDER BY last_seen DESC" in wlmDB() and store the result in {_r::*}
+    wait 5 ticks
+    set {_total} to 0
+    if {_r::pseudo::*} is set:
+        set {_total} to size of {_r::pseudo::*}
+
+    set {_perpage} to 15
+    set {_pages} to ceil({_total} / {_perpage})
+    if {_pages} < 1:
+        set {_pages} to 1
+    if {_page} < 1:
+        set {_page} to 1
+    if {_page} > {_pages}:
+        set {_page} to {_pages}
+    set {_offset} to ({_page} - 1) * {_perpage}
+
+    send "&8&m                                        " to {_admin}
+    send "{@prefix} &fWhitelist &7» &b%{_total}% &fjoueur(s) &8| &7page &f%{_page}%&7/&f%{_pages}%" to {_admin}
+    if {_total} is 0:
+        send "&7  (vide)" to {_admin}
+    else:
+        loop {_perpage} times:
+            set {_idx} to {_offset} + loop-value
+            if {_idx} > {_total}:
+                stop loop
+            set {_name} to {_r::pseudo::%{_idx}%}
+            if {_name} is set:
+                set {_by} to wlmMM({_r::added_by::%{_idx}%})
+                set {_reason} to wlmMM({_r::reason::%{_idx}%})
+                set {_addts} to {_r::added_date::%{_idx}%}
+                set {_seen} to {_r::last_seen::%{_idx}%}
+                set {_datetxt} to wlmDate({_addts})
+                # Statut coloré : gris=jamais co, jaune=vu il y a X, vert=en ligne
+                set {_seentxt} to "<gray>jamais connecté"
+                if {_by} is "migration":
+                    set {_seentxt} to "<gray>jamais reconnecté (migration)"
+                if {_seen} is set:
+                    if {_seen} is not 0:
+                        set {_seentxt} to "<yellow>il y a %wlmAgo((unix timestamp of now) - {_seen})%"
+                if {_name} parsed as player is set:
+                    set {_seentxt} to "<green>En ligne"
+                # Ligne cliquable : survol = détails, clic = suggère /whitelist remove
+                set {_hover} to "<gray>Ajouté par : <white>%{_by}%<newline><gray>Le : <white>%{_datetxt}%<newline><gray>Raison : <white>%{_reason}%<newline><gray>Connexion : %{_seentxt}%<newline><newline><yellow>Clic : pré-remplir le retrait"
+                set {_line} to "<gray>• <aqua><hover:show_text:'%{_hover}%'><click:suggest_command:'/whitelist remove %{_name}%'>%{_name}%</click></hover></aqua> <dark_gray>| %{_seentxt}%"
+                send (mini message from {_line}) to {_admin}
+
+        # Barre de navigation cliquable (◀ page X/Y ▶) -> /wlm (pas de popup)
+        set {_nav} to ""
+        if {_page} > 1:
+            set {_nav} to "<green><click:run_command:'/wlm list %{_page} - 1%'><hover:show_text:'Page précédente'>[◀ Préc]</hover></click></green> "
+        else:
+            set {_nav} to "<dark_gray>[◀ Préc] </dark_gray>"
+        set {_nav} to "%{_nav}%<gray>Page <white>%{_page}%<gray>/<white>%{_pages}% "
+        if {_page} < {_pages}:
+            set {_nav} to "%{_nav}%<green><click:run_command:'/wlm list %{_page} + 1%'><hover:show_text:'Page suivante'>[Suiv ▶]</hover></click></green>"
+        else:
+            set {_nav} to "%{_nav}%<dark_gray>[Suiv ▶]</dark_gray>"
+        send (mini message from {_nav}) to {_admin}
+    send "&8&m                                        " to {_admin}
+
+#!===============================================================================
+#! Construction d'une tête à partir d'une texture base64 (SkBee)
+#!===============================================================================
+function wlmHeadTexture(texture: text, name: text) :: item:
+    set {_h} to player head
+    apply profile component to {_h}:
+        texture-value: {_texture}
+    set name of {_h} to {_name}
+    return {_h}
+
+# Formate une durée en secondes -> texte court (ex: "3j", "5h", "12min").
+function wlmAgo(sec: number) :: text:
+    # Petites unités
+    if {_sec} < 60:
+        return "%floor({_sec})% seconde(s)"
+    if {_sec} < 3600:
+        return "%floor({_sec} / 60)% minute(s)"
+    if {_sec} < 86400:
+        return "%floor({_sec} / 3600)% heure(s)"
+    # Jours
+    set {_days} to floor({_sec} / 86400)
+    if {_days} < 30:
+        return "%{_days}% jour(s)"
+    # Mois (approx. 30 j) : "X mois et Y jours"
+    if {_days} < 365:
+        set {_months} to floor({_days} / 30)
+        set {_rem} to {_days} - ({_months} * 30)
+        if {_rem} is 0:
+            return "%{_months}% mois"
+        return "%{_months}% mois et %{_rem}% jour(s)"
+    # Années : "X ans (Z jours)"
+    set {_years} to floor({_days} / 365)
+    return "%{_years}% an(s) (%{_days}% jours)"
+
+# Formate un timestamp unix (secondes) -> "jj/mm/aaaa à HHhMM".
+# Retourne "—" si timestamp absent ou 0 (cas migration sans date).
+function wlmDate(ts: number) :: text:
+    if {_ts} is not set:
+        return "—"
+    if {_ts} <= 0:
+        return "—"
+    set {_d} to new Date({_ts} * 1000)
+    set {_sdf} to new SimpleDateFormat("dd/MM/yyyy 'à' HH'h'mm")
+    return "%{_sdf}.format({_d})%"
+
+#!===============================================================================
+#! MENU principal (double coffre, 54 slots)
+#!  Zone joueurs : slots 9-35 (3 lignes paginées, 27 têtes/page).
+#!  Barre du bas : 46 ajouter | 48 page préc. | 49 compteur | 50 page suiv.
+#!                 51 tri (spyglass) | 53 fermer.
+#!  Tri (6 modes -> {wlm::sort::%uuid%}) : 0/1 connexion récente/ancienne,
+#!  2/3 ajout récent/ancien, 4/5 alphabétique A→Z / Z→A. (skript-db exigeant une
+#!  requête LITTÉRALE, les 6 SELECT sont écrits en dur dans wlmFillMenu.)
+#!===============================================================================
+function wlmSortLabel(mode: number) :: text:
+    if {_mode} is 0:
+        return "&aConnexion récente"
+    if {_mode} is 1:
+        return "&aConnexion ancienne"
+    if {_mode} is 2:
+        return "&aAjout récent"
+    if {_mode} is 3:
+        return "&aAjout ancien"
+    if {_mode} is 4:
+        return "&aAlphabétique (A→Z)"
+    return "&aAlphabétique (Z→A)"
+
+# Ouvre le menu pour un joueur, ou prévient si lancé depuis la console.
+function wlmCmdMenu(p: player):
+    if {_p} is not set:
+        send "{@prefix} &cLe menu est réservé aux joueurs (utilise /whitelist list en console)." to console
+        stop
+    wlmOpenMenu({_p})
+
+function wlmOpenMenu(p: player):
+    set {_uuid} to "%uuid of {_p}%"
+    if {wlm::sort::%{_uuid}%} is not set:
+        set {wlm::sort::%{_uuid}%} to 0
+    if {wlm::page::%{_uuid}%} is not set:
+        set {wlm::page::%{_uuid}%} to 1
+    set {_inv} to a new chest inventory with 6 rows named "{@menu_title}"
+    add {_inv} to {wlm::menus::*}
+    # Mémorise l'inventaire ouvert pour le cycle de skins (every 2s)
+    set {wlm::openinv::%{_uuid}%} to {_inv}
+    # On ouvre d'abord, puis on remplit (le remplissage est asynchrone à cause
+    # du SELECT skript-db -> sinon le menu s'ouvrirait avant d'avoir les têtes).
+    open {_inv} to {_p}
+    wlmFillMenu({_inv}, {_p})
+
+function wlmFillMenu(inv: inventory, p: player):
+    set {_uuid} to "%uuid of {_p}%"
+    set {_sort} to {wlm::sort::%{_uuid}%}
+    set {_page} to {wlm::page::%{_uuid}%}
+
+    # Fond gris UNIQUEMENT sur les bordures (ligne 0 + ligne du bas).
+    # La zone centrale (slots 9-35) reste vide tant qu'il n'y a pas de tête,
+    # pour bien distinguer où sont les joueurs.
+    loop integers between 0 and 8:
+        set slot loop-integer of {_inv} to gray stained glass pane named " "
+    loop integers between 36 and 53:
+        set slot loop-integer of {_inv} to gray stained glass pane named " "
+    # On vide la zone têtes (au cas où un refresh laisse d'anciennes têtes)
+    loop integers between 9 and 35:
+        set slot loop-integer of {_inv} to air
+
+    # Les joueurs en ligne = "vus maintenant" -> ils trient en tête.
+    wlmTouchOnline()
+    # Récupère les joueurs triés (vider AVANT le SELECT : skript-db n'écrase pas
+    # la variable si la requête ne renvoie aucune ligne).
+    delete {_r::*}
+    # skript-db exige une chaîne LITTÉRALE pour execute (pas de variable, et un
+    # %...% deviendrait un placeholder de valeur). On fait donc 4 requêtes fixes,
+    # une par mode de tri.
+    if {_sort} is 0:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY last_seen DESC" in wlmDB() and store the result in {_r::*}
+    else if {_sort} is 1:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY last_seen ASC" in wlmDB() and store the result in {_r::*}
+    else if {_sort} is 2:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY added_date DESC" in wlmDB() and store the result in {_r::*}
+    else if {_sort} is 3:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY added_date ASC" in wlmDB() and store the result in {_r::*}
+    else if {_sort} is 4:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY pseudo COLLATE NOCASE ASC" in wlmDB() and store the result in {_r::*}
+    else:
+        execute "SELECT pseudo, uuid, added_by, added_date, reason, last_seen, skin FROM whitelist WHERE parent = '' OR parent IS NULL ORDER BY pseudo COLLATE NOCASE DESC" in wlmDB() and store the result in {_r::*}
+    wait 5 ticks
+    set {_total} to 0
+    if {_r::pseudo::*} is set:
+        set {_total} to size of {_r::pseudo::*}
+
+    # --- Précharge TOUS les alts en une seule requête (évite l'async par tête) ---
+    # On remplit, par uuid de parent :
+    #   {wlm::grpnames::%parent%::*}, {wlm::grpuuids::%parent%::*}, {wlm::grpskins::%parent%::*}
+    delete {wlm::grpnames::*}
+    delete {wlm::grpuuids::*}
+    delete {wlm::grpskins::*}
+    delete {wlm::grplastseen::*}
+    delete {_alt::*}
+    execute "SELECT pseudo, uuid, parent, skin, last_seen FROM whitelist WHERE parent <> '' AND parent IS NOT NULL ORDER BY pseudo COLLATE NOCASE ASC" in wlmDB() and store the result in {_alt::*}
+    wait 5 ticks
+    if {_alt::pseudo::*} is set:
+        loop {_alt::pseudo::*}:
+            set {_ap} to {_alt::parent::%loop-index%}
+            set {_an} to {_alt::pseudo::%loop-index%}
+            set {_au} to {_alt::uuid::%loop-index%}
+            if {_au} is not set:
+                set {_au} to ""
+            set {_ask} to {_alt::skin::%loop-index%}
+            if {_ask} is not set:
+                set {_ask} to ""
+            set {_als} to {_alt::last_seen::%loop-index%}
+            if {_als} is not set:
+                set {_als} to 0
+            add {_an} to {wlm::grpnames::%{_ap}%::*}
+            add {_au} to {wlm::grpuuids::%{_ap}%::*}
+            add {_ask} to {wlm::grpskins::%{_ap}%::*}
+            add {_als} to {wlm::grplastseen::%{_ap}%::*}
+
+    # Pagination : zone têtes = 3 lignes (slots 9-35) = 27 têtes par page.
+    set {_perpage} to 27
+    set {_pages} to ceil({_total} / {_perpage})
+    if {_pages} < 1:
+        set {_pages} to 1
+    # Bornage strict de la page courante [1 ; _pages]
+    if {_page} is not set:
+        set {_page} to 1
+    if {_page} < 1:
+        set {_page} to 1
+    if {_page} > {_pages}:
+        set {_page} to {_pages}
+    set {wlm::page::%{_uuid}%} to {_page}
+    set {_offset} to ({_page} - 1) * {_perpage}
+
+    set {_slot} to 9
+    delete {wlm::slotname::%{_uuid}%::*}
+    # IMPORTANT : on efface AUSSI toutes les assoc slot->groupe de ce joueur avant
+    # de re-remplir. Sinon, en changeant de page, le cycle every-2s continuerait à
+    # redessiner un "fantôme" sur un slot qui n'a plus de groupe sur la page courante.
+    delete {wlm::slotgroup::%{_uuid}%::*}
+    loop {_perpage} times:
+        set {_idx} to {_offset} + loop-value
+        if {_idx} > {_total}:
+            stop loop
+        set {_name} to {_r::pseudo::%{_idx}%}
+        # Garde-fou : si pas de pseudo réel, on saute (évite les têtes "none")
+        if {_name} is not set:
+            stop loop
+        set {_puuid} to {_r::uuid::%{_idx}%}
+        set {_by} to {_r::added_by::%{_idx}%}
+        set {_reason} to {_r::reason::%{_idx}%}
+        set {_addts} to {_r::added_date::%{_idx}%}
+        set {_seen} to {_r::last_seen::%{_idx}%}
+        set {_skin} to {_r::skin::%{_idx}%}
+        if {_skin} is not set:
+            set {_skin} to ""
+        # --- Groupe : alts préchargés dans {wlm::grpnames::%puuid%::*} ---
+        # On (re)construit la liste complète du groupe (principal EN TÊTE) dans
+        # {wlm::grp::%puuid%::*} pour le cycle de skins, sans requête ici.
+        set {_altCount} to 0
+        if {wlm::grpnames::%{_puuid}%::*} is set:
+            set {_altCount} to size of {wlm::grpnames::%{_puuid}%::*}
+        set {_grpCount} to 1 + {_altCount}
+        # Liste membres (noms + uuids + skins) : principal d'abord, puis alts
+        delete {wlm::grp::%{_puuid}%::names::*}
+        delete {wlm::grp::%{_puuid}%::uuids::*}
+        delete {wlm::grp::%{_puuid}%::skins::*}
+        add {_name} to {wlm::grp::%{_puuid}%::names::*}
+        add {_puuid} to {wlm::grp::%{_puuid}%::uuids::*}
+        add {_skin} to {wlm::grp::%{_puuid}%::skins::*}
+        if {_altCount} > 0:
+            loop {wlm::grpnames::%{_puuid}%::*}:
+                add loop-value-2 to {wlm::grp::%{_puuid}%::names::*}
+            loop {wlm::grpuuids::%{_puuid}%::*}:
+                add loop-value-2 to {wlm::grp::%{_puuid}%::uuids::*}
+            loop {wlm::grpskins::%{_puuid}%::*}:
+                add loop-value-2 to {wlm::grp::%{_puuid}%::skins::*}
+
+        # Tête : depuis le cache base64 ({_skin}) si dispo, sinon Steve + mise en file.
+        set {_head} to wlmMemberHead({_puuid}, {_name}, {_skin})
+
+        # Stack la tête = nombre de comptes du groupe (1 = pas de double compte)
+        if {_grpCount} > 1:
+            set {_head} to {_grpCount} of {_head}
+            set name of {_head} to "&b&l%{_name}% &7(&e%{_grpCount}% comptes&7)"
+        else:
+            set name of {_head} to "&b&l%{_name}%"
+
+        # Date d'ajout (— pour les migrés sans date)
+        set {_datetxt} to wlmDate({_addts})
+
+        # Dernière connexion (GROUPE) : "En ligne" si AU MOINS un compte connecté,
+        # sinon "il y a X" sur le compte le plus récent. bestseen + anyonline en 1 passe.
+        set {_bestseen} to {_seen}
+        if {_bestseen} is not set:
+            set {_bestseen} to 0
+        set {_anyonline} to false
+        if {_name} parsed as player is set:
+            set {_anyonline} to true
+        if {_altCount} > 0:
+            loop {wlm::grpnames::%{_puuid}%::*}:
+                set {_altn} to loop-value-2
+                set {_als2} to {wlm::grplastseen::%{_puuid}%::%loop-index%}
+                if {_als2} is set:
+                    if {_als2} > {_bestseen}:
+                        set {_bestseen} to {_als2}
+                if {_altn} parsed as player is set:
+                    set {_anyonline} to true
+        set {_seentxt} to "&7jamais connecté"
+        if {_by} is "migration":
+            set {_seentxt} to "&7jamais reconnecté depuis la migration"
+        if {_bestseen} is not 0:
+            set {_seentxt} to "&eil y a %wlmAgo((unix timestamp of now) - {_bestseen})%"
+        if {_anyonline} is true:
+            set {_seentxt} to "&aEn ligne"
+
+        # Lore : infos + liste des comptes du groupe, avec un point coloré devant
+        # chaque pseudo (vert ● = connecté, rouge ● = déconnecté).
+        set {_lore::*} to "&7Ajouté par : &f%{_by}%", "&7Ajouté le : &f%{_datetxt}%", "&7Raison : &f%{_reason}%", "&7Dernière connexion : %{_seentxt}%"
+        if {_altCount} > 0:
+            add "" to {_lore::*}
+            add "&e&lGroupe (%{_grpCount}% comptes) :" to {_lore::*}
+            # Principal en tête, avec son point d'état
+            set {_pdot} to "&c●"
+            if {_name} parsed as player is set:
+                set {_pdot} to "&a●"
+            add "&7 • %{_pdot}% &f%{_name}% &8(principal)" to {_lore::*}
+            # Puis les alts (max 3 affichés, puis +N), chacun avec son point
+            set {_shown} to 0
+            loop {wlm::grpnames::%{_puuid}%::*}:
+                if {_shown} < 3:
+                    set {_altn} to loop-value-2
+                    set {_adot} to "&c●"
+                    if {_altn} parsed as player is set:
+                        set {_adot} to "&a●"
+                    add "&7 • %{_adot}% &f%{_altn}%" to {_lore::*}
+                    add 1 to {_shown}
+            if {_altCount} > 3:
+                add "&8 ... et +%{_altCount} - 3% autre(s)" to {_lore::*}
+        set lore of {_head} to {_lore::*}
+        set slot {_slot} of {_inv} to {_head}
+        set {wlm::slotname::%{_uuid}%::%{_slot}%} to {_name}
+        # Mémorise pour le cycle de skins (every 2s) si groupe multi-comptes
+        if {_grpCount} > 1:
+            set {wlm::slotgroup::%{_uuid}%::%{_slot}%} to {_puuid}
+        else:
+            delete {wlm::slotgroup::%{_uuid}%::%{_slot}%}
+        add 1 to {_slot}
+
+    # --- Barre du bas (disposition exacte du dump) ---
+    # 46=ajouter(+vert) | 48=prev(◀) | 49=papier pages | 50=next(▶) | 51=filtre | 53=fermer
+    set {_addbtn} to wlmHeadTexture("{@head_add}", "&a&lAjouter un joueur")
+    set lore of {_addbtn} to "&7Ouvre le choix d'ajout :", "&7nouvelle personne ou double compte."
+    set slot 46 of {_inv} to {_addbtn}
+
+    if {_page} > 1:
+        set slot 48 of {_inv} to wlmHeadTexture("{@head_prev}", "&ePage précédente &7(%{_page} - 1%/%{_pages}%)")
+
+    # Papier = compteur de pages, au milieu (slot 49)
+    set {_info} to paper named "&fPage &b%{_page}%&7/&b%{_pages}%"
+    set lore of {_info} to "&7Joueurs whitelistés : &f%{_total}%", "&7Tri : %wlmSortLabel({_sort})%"
+    set slot 49 of {_inv} to {_info}
+
+    if {_page} < {_pages}:
+        set slot 50 of {_inv} to wlmHeadTexture("{@head_next}", "&ePage suivante &7(%{_page} + 1%/%{_pages}%)")
+
+    set {_filter} to spyglass named "&b&lTri : %wlmSortLabel({_sort})%"
+    set lore of {_filter} to "&7Clique pour changer de tri.", "", "&7Connexion récente / ancienne", "&7Ajout récent / ancien", "&7Alphabétique A→Z / Z→A"
+    set slot 51 of {_inv} to {_filter}
+
+    set {_close} to red wool named "&c&lFermer"
+    set slot 53 of {_inv} to {_close}
+
+#!===============================================================================
+#! Clics dans le menu
+#!===============================================================================
+on inventory click:
+    {wlm::menus::*} contains event-inventory
+    cancel event
+    if clicked inventory is not event-inventory:
+        stop
+    set {_uuid} to "%uuid of player%"
+    set {_slot} to index of event-slot
+
+    if {_slot} is 53:
+        close player's inventory
+        stop
+    else if {_slot} is 48:
+        # Ne rien faire si la flèche "précédente" n'est pas affichée (slot = vitre).
+        if slot 48 of event-inventory is a player head:
+            remove 1 from {wlm::page::%{_uuid}%}
+            wlmFillMenu(event-inventory, player)
+            play sound "ui.button.click" with volume 0.4 to player
+        stop
+    else if {_slot} is 50:
+        # Ne rien faire si la flèche "suivante" n'est pas affichée.
+        if slot 50 of event-inventory is a player head:
+            add 1 to {wlm::page::%{_uuid}%}
+            wlmFillMenu(event-inventory, player)
+            play sound "ui.button.click" with volume 0.4 to player
+        stop
+    else if {_slot} is 51:
+        add 1 to {wlm::sort::%{_uuid}%}
+        if {wlm::sort::%{_uuid}%} > 5:
+            set {wlm::sort::%{_uuid}%} to 0
+        set {wlm::page::%{_uuid}%} to 1
+        wlmFillMenu(event-inventory, player)
+        play sound "ui.button.click" with volume 0.5 to player
+        stop
+    else if {_slot} is 46:
+        # Ajout : ouvre le sous-menu de choix (nouvelle personne / double compte)
+        wlmOpenAddMenu(player)
+        play sound "ui.button.click" with volume 0.5 to player
+        stop
+    else if {_slot} is between 9 and 35:
+        # Clic sur une tête de joueur -> menu d'action.
+        #   groupe (multi-comptes) -> Menu Groupe ; sinon -> Menu sans groupe.
+        set {_pseudo} to {wlm::slotname::%{_uuid}%::%{_slot}%}
+        if {_pseudo} is not set:
+            stop
+        set {_grp} to {wlm::slotgroup::%{_uuid}%::%{_slot}%}
+        if {_grp} is set:
+            wlmOpenGroupMenu(player, {_grp})
+        else:
+            wlmOpenSoloByPseudo(player, {_pseudo})
+        play sound "ui.button.click" with volume 0.5 to player
+        stop
+
+on inventory close:
+    {wlm::menus::*} contains event-inventory
+    remove event-inventory from {wlm::menus::*}
+    delete {wlm::openinv::%uuid of player%}
+    delete {wlm::slotname::%uuid of player%::*}
+    delete {wlm::slotgroup::%uuid of player%::*}
+    # Dernier menu whitelist fermé -> libère les caches d'affichage des groupes
+    # (reconstruits au prochain wlmFillMenu ; le cycle de skins ne lit plus rien
+    # sans {wlm::openinv}, donc aucune perte).
+    if {wlm::menus::*} is not set:
+        delete {wlm::grp::*}
+        delete {wlm::grpnames::*}
+        delete {wlm::grpuuids::*}
+        delete {wlm::grpskins::*}
+        delete {wlm::grplastseen::*}
+
+#!===============================================================================
+#! SOUS-MENU D'AJOUT (clic sur le "+") — 3 lignes :
+#!   slot 11 = œil de l'ender (nouvelle personne) | 13 = tête "?" (aide)
+#!   slot 15 = perle de l'ender (double compte)   | reste = vitre noire
+#! Au clic d'une option : ferme, son de clochette, et préremplissage cliquable
+#! de la commande dans le chat + explication.
+#!===============================================================================
+function wlmOpenAddMenu(p: player):
+    set {_inv} to a new chest inventory with 3 rows named "&8Ajouter &7» &fChoix"
+    loop integers between 0 and 26:
+        set slot loop-integer of {_inv} to black stained glass pane named " "
+    # Slot 11 : œil de l'ender = nouvelle personne
+    set {_eye} to ender eye named "&a&lAjouter une nouvelle personne"
+    set lore of {_eye} to "&7Whiteliste un joueur qui n'est pas", "&7encore présent sur le serveur.", "", "&eClic → préremplit la commande dans le chat"
+    set slot 11 of {_inv} to {_eye}
+    # Slot 13 : tête "?" = aide
+    set {_help} to wlmHeadTexture("{@head_q}", "&6&l? Comment ça marche")
+    set lore of {_help} to "&aŒil de l'ender &7» nouvelle personne", "&7(joueur jamais ajouté à la whitelist).", "", "&bPerle de l'ender &7» double compte", "&7(lier un alt à un compte principal).", "", "&7Au clic, la commande se préremplit dans", "&7ton chat : complète-la puis valide."
+    set slot 13 of {_inv} to {_help}
+    # Slot 15 : perle de l'ender = double compte
+    set {_pearl} to ender pearl named "&b&lAjouter un double compte"
+    set lore of {_pearl} to "&7Lie un compte secondaire (alt) à un", "&7compte principal déjà sur le serveur.", "", "&eClic → préremplit la commande dans le chat"
+    set slot 15 of {_inv} to {_pearl}
+    add {_inv} to {wlm::addmenus::*}
+    open {_inv} to {_p}
+
+on inventory click:
+    {wlm::addmenus::*} contains event-inventory
+    cancel event
+    if clicked inventory is not event-inventory:
+        stop
+    set {_slot} to index of event-slot
+    if {_slot} is 11:
+        close player's inventory
+        play sound "block.note_block.bell" with volume 1 with pitch 1.5 to player
+        send "{@prefix} &a&lAjouter une nouvelle personne" to player
+        send "&7Clique pour préremplir, puis complète et valide :" to player
+        send (mini message from "<green><click:suggest_command:'/whitelist add player '><hover:show_text:'Cliquer pour préremplir la commande'>▶ /whitelist add player (pseudo) (commentaire)</hover></click></green>") to player
+        stop
+    else if {_slot} is 15:
+        close player's inventory
+        play sound "block.note_block.bell" with volume 1 with pitch 1.5 to player
+        send "{@prefix} &b&lAjouter un double compte" to player
+        send "&7Clique pour préremplir, puis complète et valide :" to player
+        send (mini message from "<aqua><click:suggest_command:'/whitelist add alt '><hover:show_text:'Cliquer pour préremplir la commande'>▶ /whitelist add alt (doubleCompte) (principal)</hover></click></aqua>") to player
+        send "&8Le double compte sera lié au compte principal indiqué." to player
+        stop
+
+on inventory close:
+    {wlm::addmenus::*} contains event-inventory
+    remove event-inventory from {wlm::addmenus::*}
+
+#!===============================================================================
+#! Cycle des skins de groupe (every 2s) — la tête d'un groupe multi-comptes
+#! alterne entre les membres. Lit le cache {wlm::slotgroup} + {wlm::grp::...}
+#! (aucune requête SQL) -> léger. Skin affiché depuis le cache base64.
+#!===============================================================================
+every 2 seconds:
+    set {_half} to floor((unix timestamp of now) / 2)
+    loop all players:
+        set {_u} to "%uuid of loop-player%"
+        set {_inv} to {wlm::openinv::%{_u}%}
+        if {_inv} is set:
+            loop integers between 9 and 35:
+                set {_mu} to {wlm::slotgroup::%{_u}%::%loop-integer%}
+                if {_mu} is set:
+                    set {_cnt} to size of {wlm::grp::%{_mu}%::names::*}
+                    if {_cnt} > 1:
+                        set {_cidx} to mod({_half}, {_cnt}) + 1
+                        set {_nm} to {wlm::grp::%{_mu}%::names::%{_cidx}%}
+                        set {_muuid} to {wlm::grp::%{_mu}%::uuids::%{_cidx}%}
+                        set {_msk} to {wlm::grp::%{_mu}%::skins::%{_cidx}%}
+                        if {_msk} is not set:
+                            set {_msk} to ""
+                        # Tête du membre courant (skin depuis le cache base64)
+                        set {_h} to wlmMemberHead({_muuid}, {_nm}, {_msk})
+                        # Garder le stack + nom + lore de la tête existante
+                        set {_old} to slot loop-integer of {_inv}
+                        set {_h} to {_cnt} of {_h}
+                        set name of {_h} to name of {_old}
+                        set lore of {_h} to lore of {_old}
+                        set slot loop-integer of {_inv} to {_h}
+
+#!===============================================================================
+#! Traitement de la file de skins (1 skin/seconde max -> doux pour Mojang & TPS).
+#!===============================================================================
+every 1 second:
+    # Prend le premier uuid en attente, le traite, le retire de la file.
+    {wlm::skinqueue::*} is set
+    loop {wlm::skinqueue::*}:
+        set {_u} to loop-index
+        set {_p} to loop-value
+        delete {wlm::skinqueue::%{_u}%}
+        wlmDoCacheSkin({_u}, {_p})
+        exit loop
+
+#!===============================================================================
+#! MENUS D'ACTION (clic sur une tête) — 4 menus imbriqués :
+#!   • Menu Groupe (6 lignes)  : principal (slot 13) + alts (20-24, 29-33), barrière 53 = retour
+#!   • Menu Principal (3 l.)   : mace=ban total | lave=dissoudre groupe | livre=raison | tête-=retrait | barrière 26=retour groupe
+#!   • Menu Alt (3 l.)         : ciseaux=délier | tête-=retrait | barrière 26=retour groupe
+#!   • Menu sans groupe (3 l.) : mace=ban | tête-=retrait (sans confirmation)
+#! Contexte par joueur : {wlm::act::%uuid%::*} ; mapping slot->membre : {wlm::aslot::%uuid%::%slot%::*}
+#!===============================================================================
+
+# Texte coloré "dernière connexion" pour les menus (couleurs legacy).
+#   &aEn ligne | &eil y a X | &7jamais connecté / reconnecté depuis migration.
+function wlmSeenText(name: text, seen: number, by: text) :: text:
+    if {_name} parsed as player is set:
+        return "&aEn ligne"
+    set {_s} to {_seen}
+    if {_s} is not set:
+        set {_s} to 0
+    if {_s} <= 0:
+        if {_by} is "migration":
+            return "&7jamais reconnecté depuis la migration"
+        return "&7jamais connecté"
+    return "&eil y a %wlmAgo((unix timestamp of now) - {_s})%"
+
+# --- Menu Groupe : principal en haut (slot 13) + jusqu'à 10 alts ---
+function wlmOpenGroupMenu(p: player, puuid: text):
+    set {_uuid} to "%uuid of {_p}%"
+    set {_pu} to {_puuid}
+    delete {_pr::*}
+    execute "SELECT pseudo, skin, added_by, added_date, reason, last_seen FROM whitelist WHERE uuid = %{_pu}%" in wlmDB() and store the result in {_pr::*}
+    wait 3 ticks
+    if {_pr::pseudo::*} is not set:
+        send "{@prefix} &cGroupe introuvable." to {_p}
+        stop
+    set {_ppseudo} to {_pr::pseudo::1}
+    set {_pskin} to {_pr::skin::1}
+    if {_pskin} is not set:
+        set {_pskin} to ""
+    delete {_al::*}
+    execute "SELECT pseudo, uuid, skin, added_by, added_date, last_seen FROM whitelist WHERE parent = %{_pu}% ORDER BY pseudo COLLATE NOCASE ASC" in wlmDB() and store the result in {_al::*}
+    wait 3 ticks
+    set {_inv} to a new chest inventory with 6 rows named "&8Groupe &7» &f%{_ppseudo}%"
+    loop integers between 0 and 53:
+        set slot loop-integer of {_inv} to black stained glass pane named " "
+    # Tête principale (slot 13) — détails complets (comme le menu whitelist)
+    set {_pby} to {_pr::added_by::1}
+    if {_pby} is not set:
+        set {_pby} to "—"
+    set {_pdate} to wlmDate({_pr::added_date::1})
+    set {_preason} to {_pr::reason::1}
+    if {_preason} is not set:
+        set {_preason} to "pas de commentaire"
+    set {_pseentxt} to wlmSeenText({_ppseudo}, {_pr::last_seen::1}, {_pby})
+    set {_ph} to wlmMemberHead({_pu}, {_ppseudo}, {_pskin})
+    set name of {_ph} to "&b&l%{_ppseudo}% &7(principal)"
+    set lore of {_ph} to "&7Ajouté par : &f%{_pby}%", "&7Ajouté le : &f%{_pdate}%", "&7Raison : &f%{_preason}%", "&7Dernière connexion : %{_pseentxt}%", "", "&8» Clique pour gérer (ban, dissoudre, raison, retrait)"
+    set slot 13 of {_inv} to {_ph}
+    set slot 53 of {_inv} to barrier named "&c&lRetour"
+    # Mapping + contexte (avant open : le close de l'ancien menu ne touche pas {wlm::act})
+    delete {wlm::aslot::%{_uuid}%::*}
+    set {wlm::act::%{_uuid}%::type} to "group"
+    set {wlm::act::%{_uuid}%::puuid} to {_pu}
+    set {wlm::act::%{_uuid}%::ppseudo} to {_ppseudo}
+    set {wlm::aslot::%{_uuid}%::13::role} to "principal"
+    set {wlm::aslot::%{_uuid}%::13::uuid} to {_pu}
+    set {wlm::aslot::%{_uuid}%::13::pseudo} to {_ppseudo}
+    set {_slots::*} to 20, 21, 22, 23, 24, 29, 30, 31, 32, 33
+    set {_i} to 0
+    if {_al::pseudo::*} is set:
+        loop {_al::pseudo::*}:
+            add 1 to {_i}
+            if {_i} <= 10:
+                set {_an} to {_al::pseudo::%loop-index%}
+                set {_au} to {_al::uuid::%loop-index%}
+                set {_ask} to {_al::skin::%loop-index%}
+                if {_ask} is not set:
+                    set {_ask} to ""
+                set {_sl} to {_slots::%{_i}%}
+                set {_aby} to {_al::added_by::%loop-index%}
+                if {_aby} is not set:
+                    set {_aby} to "—"
+                set {_adate} to wlmDate({_al::added_date::%loop-index%})
+                set {_aseentxt} to wlmSeenText({_an}, {_al::last_seen::%loop-index%}, {_aby})
+                set {_ah} to wlmMemberHead({_au}, {_an}, {_ask})
+                set name of {_ah} to "&e%{_an}% &7(double compte)"
+                set lore of {_ah} to "&7Ajouté par : &f%{_aby}%", "&7Ajouté le : &f%{_adate}%", "&7Dernière connexion : %{_aseentxt}%", "", "&8» Clique pour gérer (délier, retrait)"
+                set slot {_sl} of {_inv} to {_ah}
+                set {wlm::aslot::%{_uuid}%::%{_sl}%::role} to "alt"
+                set {wlm::aslot::%{_uuid}%::%{_sl}%::uuid} to {_au}
+                set {wlm::aslot::%{_uuid}%::%{_sl}%::pseudo} to {_an}
+    add {_inv} to {wlm::actmenus::*}
+    open {_inv} to {_p}
+
+# --- Menu Principal ---
+function wlmOpenPrincipalMenu(p: player, puuid: text):
+    set {_uuid} to "%uuid of {_p}%"
+    set {_pu} to {_puuid}
+    delete {_pr::*}
+    execute "SELECT pseudo, skin, reason FROM whitelist WHERE uuid = %{_pu}%" in wlmDB() and store the result in {_pr::*}
+    wait 3 ticks
+    if {_pr::pseudo::*} is not set:
+        send "{@prefix} &cCompte introuvable." to {_p}
+        stop
+    set {_ppseudo} to {_pr::pseudo::1}
+    set {_pskin} to {_pr::skin::1}
+    if {_pskin} is not set:
+        set {_pskin} to ""
+    set {_preason} to {_pr::reason::1}
+    if {_preason} is not set:
+        set {_preason} to "pas de commentaire"
+    set {_inv} to a new chest inventory with 3 rows named "&8Principal &7» &f%{_ppseudo}%"
+    loop integers between 0 and 26:
+        set slot loop-integer of {_inv} to black stained glass pane named " "
+    set {_h} to wlmMemberHead({_pu}, {_ppseudo}, {_pskin})
+    set name of {_h} to "&b&l%{_ppseudo}%"
+    set lore of {_h} to "&7Compte principal."
+    set slot 4 of {_inv} to {_h}
+    set {_mace} to mace named "&4&lBan total"
+    set lore of {_mace} to "&7Bannit &fce compte + tous ses double-comptes&7,", "&7et les retire tous de la whitelist.", "", "&eClic → tape la raison dans le chat."
+    set slot 10 of {_inv} to {_mace}
+    set {_lava} to lava bucket named "&6&lDissoudre le groupe"
+    set lore of {_lava} to "&7Délie tous les double-comptes :", "&7ils redeviennent des comptes principaux.", "&7(Personne n'est retiré de la whitelist.)", "", "&eClic → tape &fCONFIRM&e dans le chat."
+    set slot 12 of {_inv} to {_lava}
+    set {_book} to writable book named "&e&lModifier la raison"
+    set lore of {_book} to "&7Raison actuelle :", "&f%{_preason}%", "", "&eClic → tape la nouvelle raison dans le chat."
+    set slot 14 of {_inv} to {_book}
+    set {_rem} to wlmHeadTexture("{@head_remove}", "&c&lRetirer de la whitelist")
+    set lore of {_rem} to "&7Retire ce compte de la whitelist (sans ban).", "&7Ses double-comptes redeviennent principaux.", "", "&eClic → tape &fCONFIRM&e dans le chat."
+    set slot 16 of {_inv} to {_rem}
+    set slot 26 of {_inv} to barrier named "&c&lRetour"
+    delete {wlm::aslot::%{_uuid}%::*}
+    set {wlm::act::%{_uuid}%::type} to "principal"
+    set {wlm::act::%{_uuid}%::puuid} to {_pu}
+    set {wlm::act::%{_uuid}%::ppseudo} to {_ppseudo}
+    add {_inv} to {wlm::actmenus::*}
+    open {_inv} to {_p}
+
+# --- Menu Alt (double compte) ---
+function wlmOpenAltMenu(p: player, auuid: text, puuid: text):
+    set {_uuid} to "%uuid of {_p}%"
+    set {_au} to {_auuid}
+    set {_pu} to {_puuid}
+    delete {_ar::*}
+    execute "SELECT pseudo, skin FROM whitelist WHERE uuid = %{_au}%" in wlmDB() and store the result in {_ar::*}
+    wait 3 ticks
+    if {_ar::pseudo::*} is not set:
+        send "{@prefix} &cDouble compte introuvable." to {_p}
+        stop
+    set {_apseudo} to {_ar::pseudo::1}
+    set {_askin} to {_ar::skin::1}
+    if {_askin} is not set:
+        set {_askin} to ""
+    set {_inv} to a new chest inventory with 3 rows named "&8Double compte &7» &f%{_apseudo}%"
+    loop integers between 0 and 26:
+        set slot loop-integer of {_inv} to black stained glass pane named " "
+    set {_h} to wlmMemberHead({_au}, {_apseudo}, {_askin})
+    set name of {_h} to "&e&l%{_apseudo}%"
+    set lore of {_h} to "&7Double compte."
+    set slot 4 of {_inv} to {_h}
+    set {_sh} to shears named "&b&lDélier (unmerge)"
+    set lore of {_sh} to "&7Détache ce compte du groupe :", "&7il redevient un compte principal.", "&8(Reste dans la whitelist.)"
+    set slot 11 of {_inv} to {_sh}
+    set {_rem} to wlmHeadTexture("{@head_remove}", "&c&lRetirer de la whitelist")
+    set lore of {_rem} to "&7Retire ce double compte de la whitelist.", "&8(retrait direct)"
+    set slot 15 of {_inv} to {_rem}
+    set slot 26 of {_inv} to barrier named "&c&lRetour"
+    delete {wlm::aslot::%{_uuid}%::*}
+    set {wlm::act::%{_uuid}%::type} to "alt"
+    set {wlm::act::%{_uuid}%::auuid} to {_au}
+    set {wlm::act::%{_uuid}%::apseudo} to {_apseudo}
+    set {wlm::act::%{_uuid}%::puuid} to {_pu}
+    add {_inv} to {wlm::actmenus::*}
+    open {_inv} to {_p}
+
+# --- Menu sans groupe (joueur sans double-compte) ---
+function wlmOpenSoloMenu(p: player, tuuid: text, tpseudo: text):
+    set {_uuid} to "%uuid of {_p}%"
+    set {_tu} to {_tuuid}
+    set {_tp} to {_tpseudo}
+    delete {_r::*}
+    execute "SELECT skin FROM whitelist WHERE uuid = %{_tu}%" in wlmDB() and store the result in {_r::*}
+    wait 3 ticks
+    set {_skin} to ""
+    if {_r::skin::*} is set:
+        set {_skin} to {_r::skin::1}
+    if {_skin} is not set:
+        set {_skin} to ""
+    set {_inv} to a new chest inventory with 3 rows named "&8Joueur &7» &f%{_tp}%"
+    loop integers between 0 and 26:
+        set slot loop-integer of {_inv} to black stained glass pane named " "
+    set {_h} to wlmMemberHead({_tu}, {_tp}, {_skin})
+    set name of {_h} to "&b&l%{_tp}%"
+    set slot 4 of {_inv} to {_h}
+    set {_mace} to mace named "&4&lBannir"
+    set lore of {_mace} to "&7Bannit ce joueur et le retire", "&7de la whitelist.", "", "&eClic → tape la raison dans le chat."
+    set slot 11 of {_inv} to {_mace}
+    set {_rem} to wlmHeadTexture("{@head_remove}", "&c&lRetirer de la whitelist")
+    set lore of {_rem} to "&7Retire ce joueur de la whitelist.", "&8(retrait direct, sans ban)"
+    set slot 15 of {_inv} to {_rem}
+    set slot 26 of {_inv} to barrier named "&c&lRetour"
+    set {wlm::act::%{_uuid}%::type} to "solo"
+    set {wlm::act::%{_uuid}%::tuuid} to {_tu}
+    set {wlm::act::%{_uuid}%::tpseudo} to {_tp}
+    add {_inv} to {wlm::actmenus::*}
+    open {_inv} to {_p}
+
+# Ouvre le Menu sans groupe à partir d'un pseudo (récupère l'uuid en base).
+function wlmOpenSoloByPseudo(p: player, pseudo: text):
+    set {_ps} to {_pseudo}
+    delete {_q::*}
+    execute "SELECT uuid, pseudo FROM whitelist WHERE pseudo = %{_ps}%" in wlmDB() and store the result in {_q::*}
+    wait 3 ticks
+    if {_q::uuid::*} is not set:
+        send "{@prefix} &cJoueur introuvable." to {_p}
+        stop
+    wlmOpenSoloMenu({_p}, {_q::uuid::1}, {_q::pseudo::1})
+
+#!===============================================================================
+#! Clics dans les menus d'action
+#!===============================================================================
+on inventory click:
+    {wlm::actmenus::*} contains event-inventory
+    cancel event
+    if clicked inventory is not event-inventory:
+        stop
+    set {_uuid} to "%uuid of player%"
+    set {_slot} to index of event-slot
+    set {_type} to {wlm::act::%{_uuid}%::type}
+    if {_type} is "group":
+        set {_role} to {wlm::aslot::%{_uuid}%::%{_slot}%::role}
+        if {_role} is "principal":
+            play sound "ui.button.click" with volume 0.5 to player
+            wlmOpenPrincipalMenu(player, {wlm::act::%{_uuid}%::puuid})
+        else if {_role} is "alt":
+            play sound "ui.button.click" with volume 0.5 to player
+            wlmOpenAltMenu(player, {wlm::aslot::%{_uuid}%::%{_slot}%::uuid}, {wlm::act::%{_uuid}%::puuid})
+        else if {_slot} is 53:
+            play sound "ui.button.click" with volume 0.4 to player
+            wlmOpenMenu(player)
+        stop
+    else if {_type} is "principal":
+        if {_slot} is 10:
+            close player's inventory
+            wlmActAwait(player, "bantotal")
+        else if {_slot} is 12:
+            close player's inventory
+            wlmActAwait(player, "delgroup")
+        else if {_slot} is 14:
+            close player's inventory
+            wlmActAwait(player, "editreason")
+        else if {_slot} is 16:
+            close player's inventory
+            wlmActAwait(player, "removeprincipal")
+        else if {_slot} is 26:
+            play sound "ui.button.click" with volume 0.4 to player
+            wlmOpenGroupMenu(player, {wlm::act::%{_uuid}%::puuid})
+        stop
+    else if {_type} is "alt":
+        if {_slot} is 11:
+            play sound "block.shears.shear" with volume 0.6 to player
+            wlmUnmerge(player, {wlm::act::%{_uuid}%::apseudo})
+            wait 12 ticks
+            wlmOpenGroupMenu(player, {wlm::act::%{_uuid}%::puuid})
+        else if {_slot} is 15:
+            play sound "ui.button.click" with volume 0.5 to player
+            wlmRemovePlayer(player, {wlm::act::%{_uuid}%::apseudo})
+            wait 12 ticks
+            wlmOpenGroupMenu(player, {wlm::act::%{_uuid}%::puuid})
+        else if {_slot} is 26:
+            play sound "ui.button.click" with volume 0.4 to player
+            wlmOpenGroupMenu(player, {wlm::act::%{_uuid}%::puuid})
+        stop
+    else if {_type} is "solo":
+        if {_slot} is 11:
+            close player's inventory
+            wlmActAwait(player, "bansolo")
+        else if {_slot} is 15:
+            play sound "ui.button.click" with volume 0.5 to player
+            wlmRemovePlayer(player, {wlm::act::%{_uuid}%::tpseudo})
+            wait 12 ticks
+            wlmOpenMenu(player)
+        else if {_slot} is 26:
+            play sound "ui.button.click" with volume 0.4 to player
+            wlmOpenMenu(player)
+        stop
+
+on inventory close:
+    {wlm::actmenus::*} contains event-inventory
+    remove event-inventory from {wlm::actmenus::*}
+
+#!===============================================================================
+#! Saisies chat des actions (raison de ban / nouvelle raison / CONFIRM).
+#! Auto-annulation après 30s (token {wlm::actawait::%uuid%::id}).
+#!===============================================================================
+function wlmActAwait(p: player, mode: text):
+    set {_uuid} to "%uuid of {_p}%"
+    if {_mode} is "bansolo":
+        set {wlm::actawait::%{_uuid}%::tuuid} to {wlm::act::%{_uuid}%::tuuid}
+        set {wlm::actawait::%{_uuid}%::tpseudo} to {wlm::act::%{_uuid}%::tpseudo}
+    else:
+        set {wlm::actawait::%{_uuid}%::tuuid} to {wlm::act::%{_uuid}%::puuid}
+        set {wlm::actawait::%{_uuid}%::tpseudo} to {wlm::act::%{_uuid}%::ppseudo}
+    set {_tp} to {wlm::actawait::%{_uuid}%::tpseudo}
+    set {wlm::actawait::%{_uuid}%::mode} to {_mode}
+    set {_id} to "%unix timestamp of now%-%random integer between 1000 and 99999%"
+    set {wlm::actawait::%{_uuid}%::id} to {_id}
+    if {_mode} is "bantotal":
+        send "{@prefix} &4&lBan total &7de &f%{_tp}%&7 + ses double-comptes." to {_p}
+        send "&7Tape la &fraison&7 du ban dans le chat &8(30s)&7, ou &fcancel&7." to {_p}
+    else if {_mode} is "bansolo":
+        send "{@prefix} &4&lBan &7de &f%{_tp}%&7." to {_p}
+        send "&7Tape la &fraison&7 du ban dans le chat &8(30s)&7, ou &fcancel&7." to {_p}
+    else if {_mode} is "editreason":
+        send "{@prefix} &e&lModifier la raison &7de &f%{_tp}%&7." to {_p}
+        send "&7Tape la &fnouvelle raison&7 dans le chat &8(30s)&7, ou &fcancel&7." to {_p}
+    else if {_mode} is "delgroup":
+        send "{@prefix} &6&lDissoudre le groupe &7de &f%{_tp}%&7." to {_p}
+        send "&7Tape &fCONFIRM&7 (en majuscules) pour confirmer &8(30s)&7, ou &fcancel&7." to {_p}
+    else if {_mode} is "removeprincipal":
+        send "{@prefix} &c&lRetirer &f%{_tp}% &7de la whitelist." to {_p}
+        send "&7Ses double-comptes redeviendront principaux. Tape &fCONFIRM&7 &8(30s)&7, ou &fcancel&7." to {_p}
+    wait 30 seconds
+    if {wlm::actawait::%{_uuid}%::id} is {_id}:
+        delete {wlm::actawait::%{_uuid}%::*}
+        set {_pp} to {_uuid} parsed as player
+        if {_pp} is set:
+            send "{@prefix} &7Action expirée (30s) — annulée." to {_pp}
+
+on chat:
+    {wlm::actawait::%uuid of player%::mode} is set
+    cancel event
+    set {_uuid} to "%uuid of player%"
+    set {_mode} to {wlm::actawait::%{_uuid}%::mode}
+    set {_tu} to {wlm::actawait::%{_uuid}%::tuuid}
+    set {_tp} to {wlm::actawait::%{_uuid}%::tpseudo}
+    set {_msg} to message
+    delete {wlm::actawait::%{_uuid}%::*}
+    if "%{_msg}%" in lower case is "cancel":
+        send "{@prefix} &7Action annulée." to player
+        stop
+    if {_mode} is one of "bantotal", "bansolo":
+        # wlmBanGroup gère aussi un "groupe" d'un seul compte (message adapté).
+        wlmBanGroup(player, {_tu}, {_tp}, "%{_msg}%")
+        stop
+    if {_mode} is "editreason":
+        wlmEditReason(player, {_tu}, {_tp}, "%{_msg}%")
+        stop
+    if {_mode} is "delgroup":
+        if "%{_msg}%" is "CONFIRM":
+            wlmDeleteGroup(player, {_tu}, {_tp})
+        else:
+            send "{@prefix} &7Confirmation incorrecte (il fallait taper &fCONFIRM&7). Annulé." to player
+        stop
+    if {_mode} is "removeprincipal":
+        if "%{_msg}%" is "CONFIRM":
+            wlmRemovePlayer(player, {_tp})
+        else:
+            send "{@prefix} &7Confirmation incorrecte (il fallait taper &fCONFIRM&7). Annulé." to player
+        stop
+
+#!===============================================================================
+#! ACTIONS DES MENUS
+#!===============================================================================
+# Ban IP d'un compte via LiteBans (niveau proxy) — voir détail dans le corps.
+function wlmBanAccount(pseudo: text, uuid: text, reason: text):
+    set {_p} to {_pseudo}
+    set {_u} to {_uuid}
+    set {_r} to {_reason}
+    # Cible du ban : Java -> pseudo (LiteBans le résout via Mojang, OK même jamais
+    # connecté). Bedrock (".pseudo", non résolvable côté Mojang) -> UUID Floodgate
+    # (fonctionne si le joueur s'est déjà connecté ; sinon LiteBans le refuse, mais
+    # le retrait whitelist le bloque quand même).
+    set {_target} to {_p}
+    if wlmIsBedrock({_p}) is true:
+        set {_target} to {_u}
+    # Ban IP au niveau PROXY via LiteBans. /ban-ip = alias officiel de /ipban (vérifié)
+    # -> reprend le dessus quand LiteBans est là, et retombe sur le ban-ip VANILLA si
+    # LiteBans est absent. -s = silencieux (pas de spam "Console banned X").
+    execute console command "ban-ip -s %{_target}% %{_r}%"
+
+# Ban TOTAL : principal + tous ses alts (ou juste le compte si solo), puis retrait
+# de toute la chaîne. Raison : principal = raison saisie ; alt = "Double compte de
+# <principal>". On ajoute "(ban par <admin>)" à toutes les raisons.
+function wlmBanGroup(admin: player, puuid: text, ppseudo: text, reason: text):
+    set {_pu} to {_puuid}
+    set {_rtyped} to {_reason}
+    if {_rtyped} is "":
+        set {_rtyped} to "Banni"
+    set {_by} to "Console"
+    if {_admin} is set:
+        set {_by} to "%{_admin}%"
+    delete {_mem::*}
+    execute "SELECT uuid, pseudo, last_seen FROM whitelist WHERE uuid = %{_pu}% OR parent = %{_pu}%" in wlmDB() and store the result in {_mem::*}
+    wait 5 ticks
+    if {_mem::uuid::*} is not set:
+        send "{@prefix} &cGroupe introuvable." to {_admin}
+        stop
+    set {_n} to size of {_mem::uuid::*}
+    delete {_failed::*}
+    loop {_n} times:
+        set {_mu} to {_mem::uuid::%loop-value%}
+        set {_mp} to {_mem::pseudo::%loop-value%}
+        set {_mls} to {_mem::last_seen::%loop-value%}
+        if {_mls} is not set:
+            set {_mls} to 0
+        if "%{_mu}%" is "%{_pu}%":
+            set {_rfull} to "%{_rtyped}% (ban par %{_by}%)"
+        else:
+            set {_rfull} to "Double compte de %{_ppseudo}% (ban par %{_by}%)"
+        wlmBanAccount({_mp}, {_mu}, {_rfull})
+        set {_off} to Bukkit.getOfflinePlayer(UUID.fromString({_mu}))
+        {_off}.setWhitelisted(false)
+        # Alerte UNIQUEMENT pour un BEDROCK jamais connecté : lui seul échappe à
+        # LiteBans (pas de compte Mojang à résoudre, pas d'IP en base) -> non banni.
+        # Un compte Java jamais connecté EST bien banni (LiteBans le résout via Mojang).
+        if {_mls} <= 0:
+            if wlmIsBedrock({_mp}) is true:
+                add {_mp} to {_failed::*}
+    execute "DELETE FROM whitelist WHERE uuid = %{_pu}% OR parent = %{_pu}%" in wlmDB()
+    wlmInvalidateTabCache()
+    if {_n} is 1:
+        send "{@prefix} &4%{_ppseudo}% &7banni (IP) et retiré de la whitelist. Raison : &f%{_rtyped}% &8(par %{_by}%)" to {_admin}
+    else:
+        send "{@prefix} &4Ban total &7: &f%{_n}%&7 comptes du groupe de &f%{_ppseudo}% &7bannis (IP) + retirés de la whitelist. Raison : &f%{_rtyped}% &8(par %{_by}%)" to {_admin}
+    # AVERTISSEMENT (orange + son) UNIQUEMENT pour les Bedrock jamais connectés :
+    # eux seuls échappent à LiteBans (pas de compte Mojang, pas d'IP). Un Java
+    # jamais connecté, lui, est bien banni -> pas d'alerte.
+    if {_failed::*} is set:
+        set {_fc} to size of {_failed::*}
+        send "" to {_admin}
+        send "{@prefix} &6&l(!) ATTENTION &7— &6%{_fc}%&7 compte(s) Bedrock non banni(s) :" to {_admin}
+        send "&6   %{_failed::*}%" to {_admin}
+        send "&7   Bedrock &fjamais connecté(s)&7 → LiteBans n'a pas d'IP à bannir (retiré(s) de la whitelist seulement)." to {_admin}
+        send "&7   &eLe compte peut risquer de revenir&7 s'il est ré-ajouté ; le ban s'appliquera dès sa première connexion." to {_admin}
+        if {_admin} is set:
+            play sound "entity.villager.no" with volume 1 with pitch 0.7 to {_admin}
+
+# Remonte au compte PRINCIPAL du groupe d'une cible (pseudo OU uuid).
+# Résultat dans {wlm::gh::found/uuid/pseudo} (pattern transitoire — cf wlmResolve) :
+# l'appelant attend >= 12 ticks (2 requêtes), lit, puis LIBÈRE les variables.
+function wlmFindGroupHead(target: text):
+    delete {wlm::gh::*}
+    set {_t} to {_target}
+    delete {_q::*}
+    execute "SELECT uuid, pseudo, parent FROM whitelist WHERE pseudo = %{_t}% OR uuid = %{_t}%" in wlmDB() and store the result in {_q::*}
+    wait 5 ticks
+    if {_q::uuid::*} is not set:
+        set {wlm::gh::found} to false
+        stop
+    set {wlm::gh::found} to true
+    set {_parent} to {_q::parent::1}
+    if {_parent} is not set:
+        set {_parent} to ""
+    if {_parent} is "":
+        # La cible est déjà le principal.
+        set {wlm::gh::uuid} to {_q::uuid::1}
+        set {wlm::gh::pseudo} to {_q::pseudo::1}
+        stop
+    # La cible est un alt -> on récupère le pseudo de son principal.
+    set {wlm::gh::uuid} to {_parent}
+    set {wlm::gh::pseudo} to {_t}
+    delete {_pp::*}
+    execute "SELECT pseudo FROM whitelist WHERE uuid = %{_parent}%" in wlmDB() and store the result in {_pp::*}
+    wait 5 ticks
+    if {_pp::pseudo::*} is set:
+        set {wlm::gh::pseudo} to {_pp::pseudo::1}
+
+# Ban par pseudo/uuid (commande) : remonte au principal du groupe puis ban total.
+function wlmBanByTarget(admin: player, target: text, reason: text):
+    wlmFindGroupHead({_target})
+    wait 12 ticks
+    if {wlm::gh::found} is not true:
+        delete {wlm::gh::*}
+        send "{@prefix} &e%{_target}% &7n'est pas dans la whitelist." to {_admin}
+        stop
+    set {_pu} to {wlm::gh::uuid}
+    set {_pp} to {wlm::gh::pseudo}
+    delete {wlm::gh::*}
+    wlmBanGroup({_admin}, {_pu}, {_pp}, {_reason})
+
+# Dissout le groupe par pseudo/uuid (commande) : remonte au principal puis dissout.
+function wlmDissolveByPseudo(admin: player, target: text):
+    wlmFindGroupHead({_target})
+    wait 12 ticks
+    if {wlm::gh::found} is not true:
+        delete {wlm::gh::*}
+        send "{@prefix} &e%{_target}% &7n'est pas dans la whitelist." to {_admin}
+        stop
+    set {_pu} to {wlm::gh::uuid}
+    set {_pp} to {wlm::gh::pseudo}
+    delete {wlm::gh::*}
+    wlmDeleteGroup({_admin}, {_pu}, {_pp})
+
+# Modifie la raison par pseudo/uuid (commande).
+function wlmReasonByPseudo(admin: player, target: text, reason: text):
+    set {_t} to {_target}
+    delete {_q::*}
+    execute "SELECT uuid, pseudo FROM whitelist WHERE pseudo = %{_t}% OR uuid = %{_t}%" in wlmDB() and store the result in {_q::*}
+    wait 5 ticks
+    if {_q::uuid::*} is not set:
+        send "{@prefix} &e%{_target}% &7n'est pas dans la whitelist." to {_admin}
+        stop
+    wlmEditReason({_admin}, {_q::uuid::1}, {_q::pseudo::1}, {_reason})
+
+# Modifie la raison d'ajout d'un compte.
+function wlmEditReason(admin: player, uuid: text, pseudo: text, reason: text):
+    set {_u} to {_uuid}
+    set {_r} to {_reason}
+    if {_r} is "":
+        set {_r} to "pas de commentaire"
+    execute "UPDATE whitelist SET reason = %{_r}% WHERE uuid = %{_u}%" in wlmDB()
+    send "{@prefix} &aRaison mise à jour pour &f%{_pseudo}%&7 : &f%{_r}%" to {_admin}
+
+# Dissout un groupe : tous les alts redeviennent principaux.
+function wlmDeleteGroup(admin: player, puuid: text, ppseudo: text):
+    set {_pu} to {_puuid}
+    delete {_c::*}
+    execute "SELECT uuid FROM whitelist WHERE parent = %{_pu}%" in wlmDB() and store the result in {_c::*}
+    wait 5 ticks
+    set {_n} to 0
+    if {_c::uuid::*} is set:
+        set {_n} to size of {_c::uuid::*}
+    execute "UPDATE whitelist SET parent = '' WHERE parent = %{_pu}%" in wlmDB()
+    wlmInvalidateTabCache()
+    send "{@prefix} &aGroupe de &f%{_ppseudo}% &7dissous : &f%{_n}%&7 double-compte(s) redevien(nen)t principal(aux)." to {_admin}
+
+#!===============================================================================
+#! ROUTAGE central — partagé par l'interception ET la vraie commande /wlm.
+#! {_arg} = tout ce qui suit (ex: "list 2", "add Notch ami", "" pour le menu).
+#!===============================================================================
+function wlmRoute(p: player, arg: text):
+    # Réservé aux admins
+    if {_p} is set:
+        if {_p} does not have permission "{@perm}":
+            send "{@prefix} &cTu n'as pas la permission." to {_p}
+            stop
+    set {_args::*} to {_arg} split at " "
+    set {_sub} to ""
+    if {_args::1} is set:
+        set {_sub} to "%{_args::1}%" in lower case
+
+    if {_sub} is "":
+        wlmCmdMenu({_p})
+        stop
+    else if {_sub} is "menu":
+        wlmCmdMenu({_p})
+        stop
+    else if {_sub} is "list":
+        # list [page]
+        set {_lpage} to 1
+        if {_args::2} is set:
+            set {_n} to "%{_args::2}%" parsed as number
+            if {_n} is set:
+                set {_lpage} to {_n}
+        wlmListText({_p}, {_lpage})
+        stop
+    else if {_sub} is one of "reload", "sync":
+        wlmSync()
+        send "{@prefix} &aSynchronisation lancée (voir console)." to {_p}
+        stop
+    else if {_sub} is "refreshskins":
+        set {_force} to false
+        if {_args::2} is set:
+            if "%{_args::2}%" in lower case is "force":
+                set {_force} to true
+        wlmRefreshAllSkins({_p}, {_force})
+        stop
+    else if {_sub} is "add":
+        set {_what} to ""
+        if {_args::2} is set:
+            set {_what} to "%{_args::2}%" in lower case
+
+        # /whitelist add alt <alt> <principal>   (pas de raison : auto)
+        if {_what} is "alt":
+            if {_args::4} is not set:
+                send "{@prefix} &cUsage : /whitelist add alt <alt> <principal>" to {_p}
+                stop
+            wlmAddAlt({_p}, "%{_args::3}%", "%{_args::4}%")
+            stop
+
+        # /whitelist add player <joueur> [commentaire]
+        if {_what} is "player":
+            if {_args::3} is not set:
+                send "{@prefix} &cUsage : /whitelist add player <joueur> [commentaire]" to {_p}
+                stop
+            wlmAddPlayer({_p}, "%{_args::3}%", wlmJoinArgs({_args::*}, 3))
+            stop
+
+        # Sinon : aide sur le sous-menu add
+        send "{@prefix} &cUsage :" to {_p}
+        send "&b/whitelist add player <joueur> [commentaire]" to {_p}
+        send "&b/whitelist add alt <alt> <principal>" to {_p}
+        stop
+    else if {_sub} is "merge":
+        if {_args::3} is not set:
+            send "{@prefix} &cUsage : /whitelist merge <alt> <principal>" to {_p}
+            stop
+        wlmMerge({_p}, "%{_args::2}%", "%{_args::3}%")
+        stop
+    else if {_sub} is "unmerge":
+        if {_args::2} is not set:
+            send "{@prefix} &cUsage : /whitelist unmerge <joueur>" to {_p}
+            stop
+        wlmUnmerge({_p}, "%{_args::2}%")
+        stop
+    else if {_sub} is one of "remove", "del":
+        if {_args::2} is not set:
+            send "{@prefix} &cUsage : /whitelist remove <joueur>" to {_p}
+            stop
+        wlmRemovePlayer({_p}, "%{_args::2}%")
+        stop
+    else if {_sub} is "ban":
+        # /whitelist ban <joueur> [raison] -> ban TOTAL du groupe (pas de confirmation)
+        if {_args::2} is not set:
+            send "{@prefix} &cUsage : /whitelist ban <joueur> [raison]" to {_p}
+            stop
+        wlmBanByTarget({_p}, "%{_args::2}%", wlmJoinArgs({_args::*}, 2))
+        stop
+    else if {_sub} is one of "dissolve", "dissoudre", "ungroup":
+        # /whitelist dissolve <joueur> [confirm] -> dissout le groupe (CONFIRMATION requise)
+        if {_args::2} is not set:
+            send "{@prefix} &cUsage : /whitelist dissolve <joueur> confirm" to {_p}
+            stop
+        set {_target} to "%{_args::2}%"
+        set {_conf} to ""
+        if {_args::3} is set:
+            set {_conf} to "%{_args::3}%" in lower case
+        if {_conf} is "confirm":
+            wlmDissolveByPseudo({_p}, {_target})
+        else:
+            send "{@prefix} &6Dissoudre le groupe de &f%{_target}%&6 ? Les double-comptes redeviendront principaux." to {_p}
+            send (mini message from "<gold>Confirme : <click:run_command:'/whitelist dissolve %wlmMM({_target})% confirm'><hover:show_text:'Cliquer pour confirmer'>[✔ /whitelist dissolve %wlmMM({_target})% confirm]</hover></click>") to {_p}
+        stop
+    else if {_sub} is one of "reason", "raison":
+        # /whitelist reason <joueur> <nouvelle raison>
+        if {_args::3} is not set:
+            send "{@prefix} &cUsage : /whitelist reason <joueur> <nouvelle raison>" to {_p}
+            stop
+        wlmReasonByPseudo({_p}, "%{_args::2}%", wlmJoinArgs({_args::*}, 2))
+        stop
+    else:
+        send "&8&m                                        " to {_p}
+        send "{@prefix} &fCommandes disponibles :" to {_p}
+        send "&b/whitelist &7» ouvre le menu" to {_p}
+        send "&b/whitelist add player <joueur> [commentaire]" to {_p}
+        send "&b/whitelist add alt <alt> <principal> &7» ajoute + lie un double compte" to {_p}
+        send "&b/whitelist merge <alt> <principal> &7» lie un compte existant" to {_p}
+        send "&b/whitelist unmerge <joueur> &7» délie un alt (redevient principal)" to {_p}
+        send "&b/whitelist dissolve <joueur> confirm &7» dissout le groupe (alts → principaux)" to {_p}
+        send "&b/whitelist remove <joueur> &7» retire de la whitelist" to {_p}
+        send "&b/whitelist ban <joueur> [raison] &7» ban TOTAL du groupe + retrait" to {_p}
+        send "&b/whitelist reason <joueur> <raison> &7» modifie la raison d'ajout" to {_p}
+        send "&b/whitelist list &7» liste texte" to {_p}
+        send "&b/whitelist reload &7» resynchronise" to {_p}
+        send "&b/whitelist refreshskins [force] &7» récupère les skins" to {_p}
+        send "&8&m                                        " to {_p}
+        stop
+
+#!===============================================================================
+#! VRAIE commande /whitelist (alias /wl, /wlm) — reconnue par le client :
+#!  - plus de texte rouge, plus de popup de confirmation
+#!  - tab-complétion native des joueurs sur l'argument <offline player>
+#! Le routage complet est dans wlmRoute (on reconstruit la ligne d'arguments).
+#!===============================================================================
+command /whitelist [<text>]:
+    aliases: /wl, /wlm
+    permission: {@perm}
+    permission message: &cTu n'as pas la permission.
+    trigger:
+        # Un seul <text> qui capture TOUTE la ligne (pseudos inconnus inclus).
+        # La tab-complétion reste gérée par l'event 'on tab complete' (SkBee).
+        set {_a} to ""
+        if arg-1 is set:
+            set {_a} to arg-1
+        wlmRoute(player, {_a})
+
+#!===============================================================================
+#! TAB-COMPLÉTION (syntaxe SkBee : on tab complete / tab arg-N / set tab completions)
+#!  Caches rafraîchis depuis la base :
+#!    {wlm::tab::all::*}   = tous les pseudos whitelistés (remove)
+#!    {wlm::tab::main::*}  = principaux uniquement (merge cible)
+#!    {wlm::tab::alts::*}  = alts uniquement (unmerge cible)
+#!===============================================================================
+function wlmRefreshTabCache():
+    delete {wlm::tab::all::*}
+    delete {wlm::tab::main::*}
+    delete {wlm::tab::alts::*}
+    delete {_r::*}
+    execute "SELECT pseudo, parent FROM whitelist ORDER BY pseudo COLLATE NOCASE ASC" in wlmDB() and store the result in {_r::*}
+    wait 5 ticks
+    if {_r::pseudo::*} is set:
+        loop {_r::pseudo::*}:
+            set {_pn} to loop-value
+            set {_pp} to {_r::parent::%loop-index%}
+            add {_pn} to {wlm::tab::all::*}
+            if {_pp} is set:
+                if {_pp} is not "":
+                    add {_pn} to {wlm::tab::alts::*}
+                else:
+                    add {_pn} to {wlm::tab::main::*}
+            else:
+                add {_pn} to {wlm::tab::main::*}
+
+# Vide le cache du tab -> reconstruit au prochain TAB (après ajout/retrait/merge).
+function wlmInvalidateTabCache():
+    delete {wlm::tab::all::*}
+    delete {wlm::tab::main::*}
+    delete {wlm::tab::alts::*}
+
+on tab complete of "/whitelist" or "/wl" or "/wlm":
+    if player is set:
+        if player does not have permission "{@perm}":
+            stop
+    # Position 1 : les sous-commandes
+    set tab completions for position 1 to "add", "remove", "ban", "merge", "unmerge", "dissolve", "reason", "list", "reload", "refreshskins"
+    # Cache pseudos rafraîchi au 1er TAB (ou si vide)
+    if {wlm::tab::all::*} is not set:
+        wlmRefreshTabCache()
+
+    # Position 2 : dépend de la sous-commande
+    if tab arg-1 is "add":
+        set tab completions for position 2 to "player", "alt"
+    else if tab arg-1 is "remove":
+        set tab completions for position 2 to {wlm::tab::all::*}
+    else if tab arg-1 is "merge":
+        # alt à lier : un compte (de préférence un principal libre, mais on liste tout)
+        set tab completions for position 2 to {wlm::tab::all::*}
+    else if tab arg-1 is "unmerge":
+        set tab completions for position 2 to {wlm::tab::alts::*}
+    else if tab arg-1 is "ban":
+        set tab completions for position 2 to {wlm::tab::all::*}
+    else if tab arg-1 is "dissolve":
+        set tab completions for position 2 to {wlm::tab::main::*}
+    else if tab arg-1 is "reason":
+        set tab completions for position 2 to {wlm::tab::all::*}
+    else if tab arg-1 is "refreshskins":
+        set tab completions for position 2 to "force"
+
+    # Position 3 : selon "add player/alt" et "merge"
+    if tab arg-1 is "add":
+        if tab arg-2 is "player":
+            # joueurs connus / en ligne pour un nouvel ajout
+            delete {_t::*}
+            loop all players:
+                add name of loop-player to {_t::*}
+            if {_t::*} is set:
+                set tab completions for position 3 to {_t::*}
+            else:
+                set tab completions for position 3 to "<pseudo>"
+        else if tab arg-2 is "alt":
+            # 3e = le compte (nouveau ou non) ; on propose les joueurs connus
+            delete {_t::*}
+            loop all players:
+                add name of loop-player to {_t::*}
+            if {_t::*} is set:
+                set tab completions for position 3 to {_t::*}
+            else:
+                set tab completions for position 3 to "<alt>"
+    else if tab arg-1 is "merge":
+        # 3e = le principal cible (uniquement les principaux)
+        set tab completions for position 3 to {wlm::tab::main::*}
+
+    # Position 4 : add alt <alt> <principal> -> les principaux
+    if tab arg-1 is "add":
+        if tab arg-2 is "alt":
+            set tab completions for position 4 to {wlm::tab::main::*}
